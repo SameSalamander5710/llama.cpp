@@ -144,7 +144,7 @@ void set_table_entry(llama_moe_cache_layer & pub, int32_t expert, int32_t slot_o
 
 } // namespace
 
-void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t max_inserts) {
+void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t max_inserts, bool cpu_only) {
     std::lock_guard<std::mutex> init_lock(g_init_mtx);
     if (g_init_done) {
         return;
@@ -166,6 +166,10 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
         struct cand { int il; const llama_layer * l; };
         std::map<ggml_backend_buffer_type_t, std::vector<cand>> groups;
 
+        // plain CPU buffers are named "CPU" (allocated with ggml_backend_cpu_buffer_type)
+        // or "CPU_Mapped" (mmap/mapped mode, ggml_backend_cpu_buffer_from_ptr). Pinned
+        // host buffers owned by device backends such as Vulkan_Host name differently.
+
         for (size_t il = 0; il < model.layers.size(); ++il) {
             const auto & l = model.layers[il];
             if (!l.ffn_up_exps || !l.ffn_gate_exps || !l.ffn_down_exps || !l.ffn_gate_inp) {
@@ -177,6 +181,12 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
             if (!l.ffn_up_exps->buffer || !ggml_backend_buffer_is_host(l.ffn_up_exps->buffer)) {
                 continue; // experts already on a device: nothing to cache
             }
+            if (cpu_only) {
+                const char * buft_name = ggml_backend_buft_name(ggml_backend_buffer_get_type(l.ffn_up_exps->buffer));
+                if (strcmp(buft_name, "CPU") != 0 && strcmp(buft_name, "CPU_Mapped") != 0) {
+                    continue; // exps are in a pinned host buft owned by a device backend: skip
+                }
+            }
             if (!l.ffn_gate_inp->buffer || ggml_backend_buffer_is_host(l.ffn_gate_inp->buffer)) {
                 continue; // no device home for the cache
             }
@@ -184,7 +194,8 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
         }
 
         if (groups.empty()) {
-            LLAMA_LOG_INFO("%s: LLAMA_MOE_CACHE_SLOTS=%d but no host-resident expert layers found - disabled\n", __func__, n_slots);
+            LLAMA_LOG_INFO("%s: LLAMA_MOE_CACHE_SLOTS=%d but no host-resident expert layers%s found - disabled\n",
+                __func__, n_slots, cpu_only ? " (CPU-only)" : "");
             delete mc;
             return;
         }
@@ -314,8 +325,8 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
         g_cache = mc;
         g_init_done = true;
 
-        LLAMA_LOG_INFO("%s: MoE expert cache enabled: %zu layers x %d slots, %d inserts/step, %.1f MiB device memory\n",
-                __func__, mc->layers.size(), n_slots, mc->max_inserts, vram/1024.0/1024.0);
+        LLAMA_LOG_INFO("%s: MoE expert cache enabled: %zu layers x %d slots, %d inserts/step%s, %.1f MiB device memory\n",
+                __func__, mc->layers.size(), n_slots, mc->max_inserts, cpu_only ? " (CPU layers only)" : "", vram/1024.0/1024.0);
     }();
 }
 

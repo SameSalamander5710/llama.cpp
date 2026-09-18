@@ -24,6 +24,11 @@
 //    uploads per layer per step via ggml_backend_tensor_set.
 //
 // Enabled via llama_context_params.n_moe_cache_slots (CLI: --moe-expert-cache).
+// When n_moe_cache_cpu is set (CLI: --moe-expert-cache-cpu) the cache is built
+// only for expert layers whose weights live in plain CPU buffers (the default
+// mmap/mapped load, or -ot ...=CPU). Pinned host buffers owned by a device
+// backend (Vulkan_Host) are skipped, so VRAM is spent only on the slow DIMM-
+// bound experts and not on the already-fast pinned ones.
 
 #include <cstdint>
 
@@ -52,7 +57,8 @@ struct llama_moe_cache_layer {
 
 // build the cache for every host-resident expert layer of the model.
 // Safe to call more than once; only the first call does work.
-void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t max_inserts);
+// When cpu_only is set, only expert layers in plain CPU buffers are cached.
+void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t max_inserts, bool cpu_only);
 
 // nullptr when the cache is disabled or this tensor has no cached layer
 const llama_moe_cache_layer * llama_moe_cache_lookup(const ggml_tensor * up_exps);
