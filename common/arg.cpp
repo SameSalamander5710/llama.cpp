@@ -2554,6 +2554,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.n_moe_cache_inserts = value;
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_INSERTS"));
+    add_opt(common_arg(
+        {"--moe-expert-cache-cpu"},
+        "cache only plain-CPU expert layers, skip host buffers owned by device backends (e.g. Vulkan_Host)",
+        [](common_params & params) {
+            params.n_moe_cache_cpu = 1;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_CPU"));
     if (ex == LLAMA_EXAMPLE_SERVER) {
         // this is to make sure this option appears in the server-specific section of the help message
         add_opt(common_arg(
