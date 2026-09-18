@@ -22,6 +22,12 @@
 #include <alloca.h>
 #endif
 
+// flockfile/funlockfile are POSIX-only and absent from the MSVC CRT
+#if defined(_MSC_VER)
+#define flockfile(f) ((void) 0)
+#define funlockfile(f) ((void) 0)
+#endif
+
 #include <assert.h>
 #include <errno.h>
 #include <time.h>
