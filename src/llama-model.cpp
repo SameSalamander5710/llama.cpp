@@ -32,7 +32,15 @@
 #include <cstdint>
 #include <thread>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <unistd.h>
 #endif
@@ -1890,7 +1898,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     return true;
 }
 
-#ifndef _WIN32
 const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader & ml, const char * tensor_name, const ggml_tensor * t) {
     if (ml.lazy.mode != LLAMA_LAZY_MODE_DIRECT) {
         return nullptr;
@@ -1910,21 +1917,44 @@ const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader 
         return nullptr;
     }
 
-    // an independently opened buffered descriptor: dup() would share the
-    // loader's open file description, whose readahead advice and O_DIRECT
-    // flag would fight the small scattered row reads
-    const int fd = ::open(ml.files[w->idx]->name().c_str(), O_RDONLY | O_CLOEXEC);
+    // an independently opened descriptor: sharing the loader's open file
+    // description would let its readahead advice and O_DIRECT flag fight the
+    // small scattered row reads
+    const std::string & path = ml.files[w->idx]->name();
+
+#ifdef _WIN32
+    // FILE_FLAG_RANDOM_ACCESS is the readahead hint (posix_fadvise has no
+    // Windows equivalent); FILE_FLAG_OVERLAPPED lets the gather workers issue
+    // positioned reads on one handle without racing over a file pointer.
+    HANDLE fd = INVALID_HANDLE_VALUE;
+    const int wlen = ::MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+    if (wlen > 0) {
+        std::wstring wpath((size_t) wlen, L'\0');
+        ::MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), wlen);
+        fd = ::CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                nullptr, OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_OVERLAPPED, nullptr);
+    }
+    if (fd == INVALID_HANDLE_VALUE) {
+        // e.g. a FILE*-backed model has no reopenable path; the tensor is
+        // still lazy, so keep serving it through the mmap reads
+        LLAMA_LOG_WARN("%s: could not open %s for direct reads (%lu), using lazy mmap reads\n",
+                __func__, path.c_str(), (unsigned long) ::GetLastError());
+        return nullptr;
+    }
+#else
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         // e.g. a FILE*-backed model has no reopenable path; the tensor is
         // still lazy, so keep serving it through the mmap reads
         LLAMA_LOG_WARN("%s: could not open %s for direct reads (%s), using lazy mmap reads\n",
-                __func__, ml.files[w->idx]->name().c_str(), strerror(errno));
+                __func__, path.c_str(), strerror(errno));
         return nullptr;
     }
 
 #ifdef __linux__
     // rows are tiny and scattered, so sequential readahead would be pure waste
     ::posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+#endif
 #endif
 
     // in-flight reads are IO queue depth, not compute; 2x cores worked well
@@ -1940,14 +1970,6 @@ const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader 
     lazy_readers[tensor_name] = std::move(reader);
     return lazy_readers.at(tensor_name).get();
 }
-#else
-const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader & ml, const char *, const ggml_tensor *) {
-    if (ml.lazy.mode == LLAMA_LAZY_MODE_DIRECT) {
-        LLAMA_LOG_WARN("%s: --lazy-mode on-direct is not supported on this platform, using lazy mmap reads\n", __func__);
-    }
-    return nullptr;
-}
-#endif
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
