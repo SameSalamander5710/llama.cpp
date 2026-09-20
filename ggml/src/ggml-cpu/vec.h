@@ -1206,6 +1206,15 @@ inline static __m512 ggml_v_silu(__m512 x) {
     return _mm512_div_ps(x, one_plus_exp_neg_x);
 }
 
+// computes sigmoid 1/(1+exp(-x)) in single precision vector
+inline static __m512 ggml_v_sigmoid(__m512 x) {
+    const __m512 one = _mm512_set1_ps(1);
+    const __m512 zero = _mm512_setzero_ps();
+    const __m512 neg_x = _mm512_sub_ps(zero, x);
+    const __m512 exp_neg_x = ggml_v_expf(neg_x);
+    return _mm512_div_ps(one, _mm512_add_ps(one, exp_neg_x));
+}
+
 #elif defined(__AVX2__) && defined(__FMA__)
 
 // adapted from arm limited optimized routine
@@ -1259,6 +1268,15 @@ inline static __m256 ggml_v_silu(__m256 x) {
     const __m256 exp_neg_x = ggml_v_expf(neg_x);
     const __m256 one_plus_exp_neg_x = _mm256_add_ps(one, exp_neg_x);
     return _mm256_div_ps(x, one_plus_exp_neg_x);
+}
+
+// computes sigmoid 1/(1+exp(-x)) in single precision vector
+inline static __m256 ggml_v_sigmoid(__m256 x) {
+    const __m256 one = _mm256_set1_ps(1);
+    const __m256 zero = _mm256_setzero_ps();
+    const __m256 neg_x = _mm256_sub_ps(zero, x);
+    const __m256 exp_neg_x = ggml_v_expf(neg_x);
+    return _mm256_div_ps(one, _mm256_add_ps(one, exp_neg_x));
 }
 
 #elif defined(__SSE2__) // __AVX2__ / __ARM_NEON

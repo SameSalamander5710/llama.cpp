@@ -11285,6 +11285,105 @@ static void ggml_compute_forward_dsv4_hc_pre_f32(
     const int64_t ir0 = dr * ith;
     const int64_t ir1 = MIN(ir0 + dr, nr);
 
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+    // gated case with contiguous dim0. the scalar loop calls expf() per element, which blocks auto-vectorization.
+    // vectorize across n_embd (16 lanes) instead. hc stays a scalar unroll. anything else uses the scalar loop below.
+    if (gated && nbx0 == sizeof(float) && nbw0 == sizeof(float) && nbd0 == sizeof(float)) {
+        const __m512 vscale = _mm512_set1_ps(scale);
+
+        int64_t ir = ir0;
+        while (ir < ir1) {
+            const int64_t i0 = ir % n_embd;
+            const int64_t it = ir / n_embd;
+            const int64_t run = MIN(n_embd - i0, ir1 - ir); // keep vector inside one token
+
+            int64_t j = 0;
+            for (; j + 16 <= run; j += 16) {
+                __m512 sum = _mm512_setzero_ps();
+                for (int64_t ih = 0; ih < hc; ++ih) {
+                    const float * xp = (const float *) ((const char *) x->data       + (i0+j)*nbx0 + ih*nbx1 + it*nbx2);
+                    const float * gp = (const float *) ((const char *) weights->data + (i0+j)*nbw0 + ih*nbw1 + it*nbw2);
+                    const __m512 wv = ggml_v_sigmoid(_mm512_loadu_ps(gp));
+                    sum = _mm512_fmadd_ps(_mm512_loadu_ps(xp), wv, sum);
+                }
+                sum = _mm512_mul_ps(sum, vscale);
+                _mm512_storeu_ps((float *) ((char *) dst->data + (i0+j)*nbd0 + it*nbd1), sum);
+            }
+
+            // masked tail: same vector math as above, so the result does not depend
+            // on the thread partition. a scalar expf() tail would break that.
+            const int64_t rem = run - j;
+            if (rem > 0) {
+                const __mmask16 mask = _mm512_int2mask(((uint32_t) 1 << rem) - 1);
+                __m512 sum = _mm512_setzero_ps();
+                for (int64_t ih = 0; ih < hc; ++ih) {
+                    const float * xp = (const float *) ((const char *) x->data       + (i0+j)*nbx0 + ih*nbx1 + it*nbx2);
+                    const float * gp = (const float *) ((const char *) weights->data + (i0+j)*nbw0 + ih*nbw1 + it*nbw2);
+                    const __m512 xv = _mm512_mask_loadu_ps(_mm512_setzero_ps(), mask, xp);
+                    const __m512 wv = _mm512_mask_loadu_ps(_mm512_setzero_ps(), mask, gp);
+                    sum = _mm512_fmadd_ps(xv, ggml_v_sigmoid(wv), sum);
+                }
+                sum = _mm512_mul_ps(sum, vscale);
+                _mm512_mask_storeu_ps((float *) ((char *) dst->data + (i0+j)*nbd0 + it*nbd1), mask, sum);
+            }
+            ir += run;
+        }
+        return;
+    }
+#elif defined(__AVX2__) && defined(__FMA__)
+    // same as above, 8 lanes. only reached when AVX512 is not active.
+    if (gated && nbx0 == sizeof(float) && nbw0 == sizeof(float) && nbd0 == sizeof(float)) {
+        const __m256 vscale = _mm256_set1_ps(scale);
+
+        int64_t ir = ir0;
+        while (ir < ir1) {
+            const int64_t i0 = ir % n_embd;
+            const int64_t it = ir / n_embd;
+            const int64_t run = MIN(n_embd - i0, ir1 - ir); // keep vector inside one token
+
+            int64_t j = 0;
+            for (; j + 8 <= run; j += 8) {
+                __m256 sum = _mm256_setzero_ps();
+                for (int64_t ih = 0; ih < hc; ++ih) {
+                    const float * xp = (const float *) ((const char *) x->data       + (i0+j)*nbx0 + ih*nbx1 + it*nbx2);
+                    const float * gp = (const float *) ((const char *) weights->data + (i0+j)*nbw0 + ih*nbw1 + it*nbw2);
+                    const __m256 wv = ggml_v_sigmoid(_mm256_loadu_ps(gp));
+                    sum = _mm256_fmadd_ps(_mm256_loadu_ps(xp), wv, sum);
+                }
+                sum = _mm256_mul_ps(sum, vscale);
+                _mm256_storeu_ps((float *) ((char *) dst->data + (i0+j)*nbd0 + it*nbd1), sum);
+            }
+
+            // masked tail: same vector math as above, so the result does not depend
+            // on the thread partition. a scalar expf() tail would break that.
+            const int64_t rem = run - j;
+            if (rem > 0) {
+                const __m256i mask = _mm256_set_epi32(
+                        rem > 7 ? -1 : 0,
+                        rem > 6 ? -1 : 0,
+                        rem > 5 ? -1 : 0,
+                        rem > 4 ? -1 : 0,
+                        rem > 3 ? -1 : 0,
+                        rem > 2 ? -1 : 0,
+                        rem > 1 ? -1 : 0,
+                        rem > 0 ? -1 : 0);
+                __m256 sum = _mm256_setzero_ps();
+                for (int64_t ih = 0; ih < hc; ++ih) {
+                    const float * xp = (const float *) ((const char *) x->data       + (i0+j)*nbx0 + ih*nbx1 + it*nbx2);
+                    const float * gp = (const float *) ((const char *) weights->data + (i0+j)*nbw0 + ih*nbw1 + it*nbw2);
+                    const __m256 xv = _mm256_maskload_ps(xp, mask);
+                    const __m256 wv = _mm256_maskload_ps(gp, mask);
+                    sum = _mm256_fmadd_ps(xv, ggml_v_sigmoid(wv), sum);
+                }
+                sum = _mm256_mul_ps(sum, vscale);
+                _mm256_maskstore_ps((float *) ((char *) dst->data + (i0+j)*nbd0 + it*nbd1), mask, sum);
+            }
+            ir += run;
+        }
+        return;
+    }
+#endif
+
     for (int64_t ir = ir0; ir < ir1; ++ir) {
         const int64_t i0 = ir % n_embd;
         const int64_t it = ir / n_embd;
