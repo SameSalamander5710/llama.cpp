@@ -833,6 +833,10 @@ struct ggml_backend_sched {
 
     bool prefetch_weights; // prefetch the next split inputs, overlapping with the current split compute
 
+    // prefetch support: events for compute/transfer overlap of streamed host weights
+    ggml_backend_event_t copy_events[GGML_SCHED_MAX_BACKENDS];    // data ready (copy -> compute sync)
+    ggml_backend_event_t compute_events[GGML_SCHED_MAX_BACKENDS]; // memory free (compute -> copy sync)
+
     int debug;
 
     // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
@@ -846,6 +850,19 @@ struct ggml_backend_sched {
 #define tensor_backend_id(tensor) sched->hv_tensor_backend_ids[hash_id(tensor)]
 #define tensor_id_copy(id, backend_id, copy_id) sched->hv_tensor_copies[(id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id)]
 #define tensor_copy(tensor, backend_id, copy_id) tensor_id_copy(hash_id(tensor), backend_id, copy_id)
+
+// prefetch is enabled for a backend when weight prefetching is requested and the backend
+// supports the events used to synchronize the compute queue with the async copy queue
+static bool ggml_backend_sched_prefetch_active(ggml_backend_sched_t sched, int backend_id) {
+    return sched->prefetch_weights && sched->n_copies == 1 && sched->copy_events[backend_id] != NULL;
+}
+
+static bool ggml_backend_sched_is_host_weight(ggml_backend_sched_t sched, struct ggml_tensor * t) {
+    GGML_UNUSED(sched);
+    return t->buffer != NULL &&
+        t->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+        ggml_backend_buffer_is_host(t->buffer);
+}
 
 static void ggml_backend_sched_split_inputs_grow(struct ggml_backend_sched_split * split) {
     int new_cap = GGML_SCHED_MAX_SPLIT_INPUTS;
@@ -1912,6 +1929,11 @@ ggml_backend_sched_t ggml_backend_sched_new(
                 sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
             }
         }
+
+        if (prefetch_weights && sched->n_copies == 1) {
+            sched->copy_events[b]    = ggml_backend_event_new(backends[b]->device);
+            sched->compute_events[b] = ggml_backend_event_new(backends[b]->device);
+        }
     }
 
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
@@ -1931,6 +1953,8 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
         }
+        ggml_backend_event_free(sched->copy_events[b]);
+        ggml_backend_event_free(sched->compute_events[b]);
     }
     ggml_gallocr_free(sched->galloc);
     ggml_free(sched->ctx);
