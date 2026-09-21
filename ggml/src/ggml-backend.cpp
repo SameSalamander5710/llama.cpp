@@ -1728,11 +1728,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    // debug: per-split timing breakdown, gated by GGML_SCHED_SPLIT_TIMES
+    const bool split_times = getenv("GGML_SCHED_SPLIT_TIMES") ? atoi(getenv("GGML_SCHED_SPLIT_TIMES")) : 0;
+    int64_t st_t0 = 0, st_t_copy = 0, st_t_sync = 0, st_t_compute = 0;
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
         const bool prefetch_active = ggml_backend_sched_prefetch_active(sched, split_backend_id);
+
+        if (split_times) {
+            st_t0 = ggml_time_us();
+        }
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -1742,6 +1750,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             } else {
                 ggml_backend_synchronize(sched->backends[prev_backend_id]);
             }
+        }
+        if (split_times) {
+            st_t_sync += ggml_time_us() - st_t0;
+            st_t0 = ggml_time_us();
         }
 
         // copy the input tensors to the split backend
@@ -1879,6 +1891,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        if (split_times) {
+            st_t_copy += ggml_time_us() - st_t0;
+            st_t0 = ggml_time_us();
+        }
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -1964,6 +1981,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         prev_backend_id = split_backend_id;
+
+        if (split_times) {
+            st_t_compute += ggml_time_us() - st_t0;
+            GGML_LOG_INFO("sched-split-times split=%d backend=%d inputs=%d nodes=%d total=%lldus copy=%lldus sync=%lldus compute=%lldus\n",
+                split_id, split_backend_id, split->n_inputs, split->graph.n_nodes,
+                (long long) (st_t_copy + st_t_sync + st_t_compute),
+                (long long) st_t_copy, (long long) st_t_sync, (long long) st_t_compute);
+        }
     }
 
     return GGML_STATUS_SUCCESS;
