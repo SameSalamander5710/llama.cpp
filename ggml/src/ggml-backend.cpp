@@ -1872,9 +1872,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
 
     sched->n_backends = n_backends;
-    // prefetch weights overlap the input copy with the compute of the current split,
-    // so two copy slots are needed (double buffering) to avoid overwriting an input that is still in use
-    sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : (prefetch_weights ? 2 : 1);
+    // the copy slot is always 0 for the non-parallel path: transient per-split input copies
+    // are reused by gallocr after each split, so no whole-graph 2x staging is needed
+    sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
 
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
