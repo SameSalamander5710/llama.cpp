@@ -1984,10 +1984,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         if (split_times) {
             st_t_compute += ggml_time_us() - st_t0;
-            GGML_LOG_INFO("sched-split-times split=%d backend=%d inputs=%d nodes=%d total=%lldus copy=%lldus sync=%lldus compute=%lldus\n",
-                split_id, split_backend_id, split->n_inputs, split->graph.n_nodes,
+            char node_names[256] = { 0 };
+            size_t len = 0;
+            for (int j = 0; j < split->graph.n_nodes && len < 250; j++) {
+                len += snprintf(node_names + len, sizeof(node_names) - len, "%s%s",
+                    j > 0 ? "," : "", split->graph.nodes[j]->name);
+            }
+            GGML_LOG_INFO("sched-split-times split=%d backend=%s(%d) inputs=%d nodes=%d total=%lldus copy=%lldus sync=%lldus compute=%lldus [%s]\n",
+                split_id, ggml_backend_name(split_backend), split_backend_id, split->n_inputs, split->graph.n_nodes,
                 (long long) (st_t_copy + st_t_sync + st_t_compute),
-                (long long) st_t_copy, (long long) st_t_sync, (long long) st_t_compute);
+                (long long) st_t_copy, (long long) st_t_sync, (long long) st_t_compute, node_names);
         }
     }
 
