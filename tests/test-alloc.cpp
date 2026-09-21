@@ -639,7 +639,7 @@ static bool graph_reuses_allocation(bool add_alloc_dep) {
 
     ggml_backend_t             backend_ptr = &backend.context->backend;
     ggml_backend_buffer_type_t buft        = &backend.buffer_type;
-    ggml_backend_sched_ptr     sched(ggml_backend_sched_new(&backend_ptr, &buft, 1, 8, false, true));
+    ggml_backend_sched_ptr     sched(ggml_backend_sched_new(&backend_ptr, &buft, 1, 8, false, true, false));
     GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
 
     return x[1]->data == x[2]->data;

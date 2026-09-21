@@ -831,6 +831,8 @@ struct ggml_backend_sched {
 
     bool op_offload;
 
+    bool prefetch_weights; // prefetch the next split inputs, overlapping with the current split compute
+
     int debug;
 
     // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
@@ -1851,7 +1853,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
         int n_backends,
         size_t graph_size,
         bool parallel,
-        bool op_offload) {
+        bool op_offload,
+        bool prefetch_weights) {
     GGML_ASSERT(n_backends > 0);
     GGML_ASSERT(n_backends <= GGML_SCHED_MAX_BACKENDS);
     GGML_ASSERT(ggml_backend_dev_type(ggml_backend_get_device(backends[n_backends - 1])) == GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -1869,7 +1872,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
 
     sched->n_backends = n_backends;
-    sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
+    // prefetch weights overlap the input copy with the compute of the current split,
+    // so two copy slots are needed (double buffering) to avoid overwriting an input that is still in use
+    sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : (prefetch_weights ? 2 : 1);
 
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
@@ -1911,6 +1916,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;
+    sched->prefetch_weights = prefetch_weights;
 
     ggml_backend_sched_reset(sched);
 

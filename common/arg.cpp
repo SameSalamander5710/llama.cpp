@@ -259,6 +259,11 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
         if (buft) {
             buft_list[ggml_backend_buft_name(buft)] = buft;
         }
+        // host buffer types (e.g. Vulkan_Host) so CPU-resident tensors can use pinned memory
+        auto * host_buft = ggml_backend_dev_host_buffer_type(dev);
+        if (host_buft) {
+            buft_list[ggml_backend_buft_name(host_buft)] = host_buft;
+        }
     }
 
     for (const auto & override : string_split<std::string>(value, ',')) {
@@ -2752,6 +2757,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             parse_tensor_buffer_overrides(value, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_OVERRIDE_TENSOR"));
+    add_opt(common_arg(
+        {"-pw", "--prefetch-weights"}, "N",
+        "prefetch the tensor overrides of a layer while computing the current layer (0 = off, 1 = on)\n"
+        "requires the overridden tensors to be in a host buffer pinned to the device (e.g. Vulkan_Host)",
+        [](common_params & params, int value) {
+            params.prefetch_weights = value;
+        }
+    ));
     add_opt(common_arg(
         {"-cmoe", "--cpu-moe"},
         "keep all Mixture of Experts (MoE) weights in the CPU",
