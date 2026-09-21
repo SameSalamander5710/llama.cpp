@@ -1360,9 +1360,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 }
             }
 
-            // prefetch: also force a new split at the first use of a streamed host weight, so each
-            // chunk of streamed weights gets its own split and the staging memory of previously
-            // consumed chunks can be reused by the allocator (rolling window)
+            // prefetch: force a new split at the first use of a streamed host weight, so each
+            // chunk of streamed weights gets its own split and consumed memory is freed
             if (!need_new_split && node_backend_id == cur_backend_id &&
                 ggml_backend_sched_prefetch_active(sched, cur_backend_id)) {
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
@@ -1546,9 +1545,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     for (int i = 0; i < sched->n_splits; i++) {
         struct ggml_backend_sched_split * split = &sched->splits[i];
 
-        // prefetch: keep the previous split's staging copies allocated while this split's copies
-        // are allocated, so consecutive chunks do not alias the same memory window (memory is
-        // still reused every two splits, which matches the compute_events wait in the prefetch)
+        // prefetch: keep the previous split's staging copies alive while this split allocates,
+        // so consecutive chunks do not alias the same memory window
         if (i > 0 && ggml_backend_sched_prefetch_active(sched, sched->splits[i - 1].backend_id)) {
             const std::vector<ggml_tensor *> keep = [&]() {
                 std::vector<ggml_tensor *> keep_copies;
@@ -1734,6 +1732,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        const bool prefetch_active = ggml_backend_sched_prefetch_active(sched, split_backend_id);
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -1747,8 +1746,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
-            ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
+
+            // prefetch: weights with a same-backend predecessor were staged by the
+            // previous split's prefetch, so skip the copy and its synchronization
+            if (prefetch_active && split_id > 0 && prev_backend_id == split_backend_id &&
+                ggml_backend_sched_is_host_weight(sched, input)) {
+                continue;
+            }
+
+            ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
@@ -1878,6 +1885,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 return ec;
             }
         } else {
+            // prefetch the next split's streamed weights before computing, the callback
+            // path synchronizes the backend per node so there is no room for overlap
+            if (prefetch_active && split_id + 1 < sched->n_splits && splits[split_id + 1].backend_id == split_backend_id) {
+                struct ggml_backend_sched_split * next = &splits[split_id + 1];
+                for (int input_id = 0; input_id < next->n_inputs; input_id++) {
+                    struct ggml_tensor * next_input = next->inputs[input_id];
+                    if (ggml_backend_sched_is_host_weight(sched, next_input)) {
+                        ggml_backend_tensor_set_async(split_backend,
+                            tensor_copy(next_input, split_backend_id, sched->cur_copy),
+                            (const uint8_t *) next_input->data, 0, ggml_nbytes(next_input));
+                    }
+                }
+                ggml_backend_event_record(sched->copy_events[split_backend_id], split_backend);
+            }
+
             // similar to ggml_backend_compare_graph_backend
             for (int j0 = 0; j0 < split->graph.n_nodes; j0++) {
                 struct ggml_tensor * t = split->graph.nodes[j0];
@@ -1914,6 +1936,31 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // record the event of this split
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+        }
+
+        // prefetch the next split's streamed weights, overlapping the copies with the
+        // compute of this split; the copies of two splits ago are overwritten
+        if (!sched->callback_eval && prefetch_active && split_id + 1 < sched->n_splits &&
+            splits[split_id + 1].backend_id == split_backend_id) {
+            if (prev_backend_id == split_backend_id) {
+                ggml_backend_event_wait(split_backend, sched->compute_events[split_backend_id]);
+            }
+            struct ggml_backend_sched_split * next = &splits[split_id + 1];
+            for (int input_id = 0; input_id < next->n_inputs; input_id++) {
+                struct ggml_tensor * next_input = next->inputs[input_id];
+                if (ggml_backend_sched_is_host_weight(sched, next_input)) {
+                    ggml_backend_tensor_set_async(split_backend,
+                        tensor_copy(next_input, split_backend_id, sched->cur_copy),
+                        (const uint8_t *) next_input->data, 0, ggml_nbytes(next_input));
+                }
+            }
+            ggml_backend_event_record(sched->copy_events[split_backend_id], split_backend);
+        }
+
+        // record the compute event of this split, so the next prefetch waits for the
+        // compute that read the staging window it will overwrite
+        if (prefetch_active) {
+            ggml_backend_event_record(sched->compute_events[split_backend_id], split_backend);
         }
 
         prev_backend_id = split_backend_id;
