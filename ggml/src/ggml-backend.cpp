@@ -1360,6 +1360,30 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 }
             }
 
+            // prefetch: also force a new split at the first use of a streamed host weight, so each
+            // chunk of streamed weights gets its own split and the staging memory of previously
+            // consumed chunks can be reused by the allocator (rolling window)
+            if (!need_new_split && node_backend_id == cur_backend_id &&
+                ggml_backend_sched_prefetch_active(sched, cur_backend_id)) {
+                for (int j = 0; j < GGML_MAX_SRC; j++) {
+                    struct ggml_tensor * src = node->src[j];
+                    if (src == NULL || !ggml_backend_sched_is_host_weight(sched, src)) {
+                        continue;
+                    }
+                    bool already_input = false;
+                    for (int k = 0; k < split->n_inputs; k++) {
+                        if (split->inputs[k] == src) {
+                            already_input = true;
+                            break;
+                        }
+                    }
+                    if (!already_input) {
+                        need_new_split = true;
+                        break;
+                    }
+                }
+            }
+
             if (node_backend_id != cur_backend_id || need_new_split) {
                 split->i_end = i;
                 i_split++;
@@ -1491,7 +1515,15 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     for (int i = 0; i < sched->n_splits; i++) {
         total_inputs += sched->splits[i].n_inputs;
     }
-    int graph_size = std::max(graph->n_nodes, graph->n_leafs) + total_inputs * 2 * sched->n_copies + n_dep_nodes;
+    // prefetch: the keep-alive nodes that pin the previous split's staging copies while the
+    // next split's copies are allocated (one node per GGML_MAX_SRC staging copies)
+    int n_keep_alive_nodes = 0;
+    for (int i = 1; i < sched->n_splits; i++) {
+        if (ggml_backend_sched_prefetch_active(sched, sched->splits[i - 1].backend_id)) {
+            n_keep_alive_nodes += (sched->splits[i - 1].n_inputs + GGML_MAX_SRC - 1) / GGML_MAX_SRC;
+        }
+    }
+    int graph_size = std::max(graph->n_nodes, graph->n_leafs) + total_inputs * 2 * sched->n_copies + n_dep_nodes + n_keep_alive_nodes;
 
     // remember the actual graph_size for performing reallocation checks later [GGML_SCHED_DEBUG_REALLOC]
     sched->debug_prev_graph_size = sched->debug_graph_size;
@@ -1513,6 +1545,32 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     for (int i = 0; i < sched->n_splits; i++) {
         struct ggml_backend_sched_split * split = &sched->splits[i];
+
+        // prefetch: keep the previous split's staging copies allocated while this split's copies
+        // are allocated, so consecutive chunks do not alias the same memory window (memory is
+        // still reused every two splits, which matches the compute_events wait in the prefetch)
+        if (i > 0 && ggml_backend_sched_prefetch_active(sched, sched->splits[i - 1].backend_id)) {
+            const std::vector<ggml_tensor *> keep = [&]() {
+                std::vector<ggml_tensor *> keep_copies;
+                struct ggml_backend_sched_split * prev = &sched->splits[i - 1];
+                for (int j = 0; j < prev->n_inputs; j++) {
+                    struct ggml_tensor * input_cpy = tensor_id_copy(hash_id(prev->inputs[j]), prev->backend_id, 0);
+                    if (input_cpy != NULL) {
+                        keep_copies.push_back(input_cpy);
+                    }
+                }
+                return keep_copies;
+            }();
+            for (size_t k = 0; k < keep.size(); k += GGML_MAX_SRC) {
+                struct ggml_tensor * dep = ggml_view_tensor(sched->ctx, keep[k]);
+                for (size_t s = 0; s < GGML_MAX_SRC && k + s < keep.size(); s++) {
+                    dep->src[s] = keep[k + s];
+                }
+                assert(graph_copy->size > graph_copy->n_nodes);
+                sched->node_backend_ids[graph_copy->n_nodes] = sched->splits[i - 1].backend_id;
+                graph_copy->nodes[graph_copy->n_nodes++] = dep;
+            }
+        }
 
         // add inputs to the graph copy so that they are allocated by ggml-alloc at the start of the split
         for (int j = 0; j < split->n_inputs; j++) {
