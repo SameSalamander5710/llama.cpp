@@ -1502,7 +1502,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         split->n_prefetch = 0;
         split->prefetch_slot = -1;
         split->prefetch_pack = 0;
+        const int prefetch_max_lookahead = 8;
         size_t split_pack = 0;
+        int n_prefetch_nodes = 0;
         int cur_backend_id = split->backend_id;
         for (; i < graph->n_nodes; i++) {
             struct ggml_tensor * node = graph->nodes[i];
@@ -1517,19 +1519,28 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
             // check if we should start a new split based on the sources of the current node
             bool need_new_split = false;
-            if (node_backend_id == cur_backend_id && split->n_inputs > 0) {
+            if (node_backend_id == cur_backend_id && (split->n_inputs > 0 || n_prefetch_nodes > 0)) {
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     struct ggml_tensor * src = node->src[j];
                     if (src == NULL) {
                         continue;
                     }
                     // check if a weight is on a different and incompatible backend
-                    // by starting a new split, the memory of the previously offloaded weights can be reused
-                    if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                    // by starting a new split, the memory of the previously offloaded weights can be reused.
+                    // Prefetched host weights use dedicated staging slots instead of gallocr-managed copies,
+                    // so they do not increment split->n_inputs and would bypass this guard entirely.
+                    // Use a bounded lookahead so consecutive weight-offloading nodes fuse into one split
+                    // instead of collapsing the entire chain into a single split.
+                    const bool prefetch_candidate = ggml_backend_sched_prefetch_candidate(sched, src, node, cur_backend_id);
+                    ggml_backend_buffer_t src_buf = src->view_src ? src->view_src->buffer : src->buffer;
+                    const bool weight = src_buf != NULL && ggml_backend_buffer_get_usage(src_buf) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+                    if (prefetch_candidate || weight) {
                         int src_backend_id = tensor_backend_id(src);
                         if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
-                            need_new_split = true;
-                            break;
+                            if (!prefetch_candidate || n_prefetch_nodes >= prefetch_max_lookahead) {
+                                need_new_split = true;
+                                break;
+                            }
                         }
                     }
                 }
@@ -1558,9 +1569,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 split->prefetch_pack = 0;
                 cur_backend_id = node_backend_id;
                 split_pack = 0;
+                n_prefetch_nodes = 0;
             }
 
             // find inputs that are not on the same backend
+            bool node_has_prefetch = false;
             for (int j = 0; j < GGML_MAX_SRC; j++) {
                 struct ggml_tensor * src = node->src[j];
                 if (src == NULL) {
@@ -1598,6 +1611,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
                     // stage host-resident weights on the split's backend instead of copying them
                     if (ggml_backend_sched_prefetch_candidate(sched, src, node, cur_backend_id)) {
+                        node_has_prefetch = true;
                         int slot = split->prefetch_slot;
                         if (slot < 0) {
                             slot = sched->prefetch_slot_cursor[cur_backend_id];
@@ -1644,6 +1658,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
                     }
                 }
+            }
+            if (node_has_prefetch) {
+                n_prefetch_nodes++;
             }
         }
         split->i_end = graph->n_nodes;
