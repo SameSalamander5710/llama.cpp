@@ -734,6 +734,83 @@ static void test_prefetch_staging_slots() {
     GGML_ASSERT(b0 >= a0 + an || a0 >= b0 + bn);
 }
 
+// Chained weight-offloading nodes on the same device backend with no
+// intervening host-backend node — the shape that real FFN blocks produce
+// under full GPU offload (the activation between ffn_up and ffn_down runs
+// on the device too). Without bounded fusion, all host weights collapse
+// into a single split; with the fix, splits are formed at every
+// max_lookahead boundary.
+static void test_prefetch_bounded_fusion() {
+    const int n_weights      = 20;
+    const int max_lookahead  = 8;
+    const int expected_splits = (n_weights + max_lookahead - 1) / max_lookahead; // ceil(20/8) = 3
+
+    dummy_backend backend_device = dummy_backend_init(SIZE_MAX);
+    dummy_backend backend_host   = dummy_backend_init(SIZE_MAX);
+    backend_device.context->is_host = false;
+
+    auto [ctx_w, _w, ctx_w_ptr] = make_context();
+    auto [ctx_x, _x, ctx_x_ptr] = make_context();
+    auto [ctx,   graph, ctx_ptr] = make_context();
+
+    // weights are plain tensors (no INPUT flag) in a host buffer
+    std::vector<ggml_tensor *> weights(n_weights);
+    for (int i = 0; i < n_weights; i++) {
+        weights[i] = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, 4, 4);
+        ggml_format_name(weights[i], "w%d", i);
+    }
+
+    // activation on the device buffer
+    ggml_tensor * x = ggml_new_tensor_2d(ctx_x, GGML_TYPE_F32, 4, 1);
+    ggml_set_input(x);
+    ggml_format_name(x, "x");
+
+    ggml_backend_buffer_ptr buf_x(ggml_backend_alloc_ctx_tensors_from_buft(ctx_x, &backend_device.buffer_type));
+    ggml_backend_buffer_ptr buf_w(ggml_backend_alloc_ctx_tensors_from_buft(ctx_w, &backend_host.buffer_type));
+    GGML_ASSERT(buf_x && buf_w);
+    ggml_backend_buffer_set_usage(buf_w.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    // chain: m0 = mul_mat(w0, x), m1 = mul_mat(w1, m0), ...
+    // every MUL_MAT is offloaded to the device backend; the weights are on
+    // the host backend and staged via prefetch; no host-backend node between
+    // consecutive mul_mats — the discriminating case that the existing
+    // test_prefetch_staging_slots does not exercise
+    std::vector<ggml_tensor *> muls(n_weights);
+    ggml_tensor * prev = x;
+    for (int i = 0; i < n_weights; i++) {
+        muls[i] = ggml_mul_mat(ctx, weights[i], prev);
+        ggml_format_name(muls[i], "m%d", i);
+        prev = muls[i];
+    }
+    ggml_set_output(prev);
+    ggml_build_forward_expand(graph, prev);
+
+    // sanity: the graph is a pure chain of weight-offloading nodes with no
+    // host-backend intermediate that would force splits on its own
+    GGML_ASSERT(graph->n_nodes == n_weights);
+    for (int i = 0; i < n_weights; i++) {
+        GGML_ASSERT(graph->nodes[i]->op == GGML_OP_MUL_MAT);
+    }
+
+    ggml_backend_t             backend_ptr[2] = { &backend_device.context->backend, &backend_host.context->backend };
+    ggml_backend_buffer_type_t bufts[2]       = { &backend_device.buffer_type, &backend_host.buffer_type };
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(backend_ptr, bufts, 2, n_weights * 2, false, true));
+    ggml_backend_sched_set_prefetch(sched.get(), true);
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
+
+    // Without the bounded-fusion fix, all n_weights weight-offloading nodes
+    // collapse into a single split (n_splits == 1). With the fix, splits are
+    // formed at every max_lookahead boundary.
+    const int n_splits = ggml_backend_sched_get_n_splits(sched.get());
+    GGML_ASSERT(n_splits == expected_splits);
+
+    // every weight must be staged into the device prefetch buffer
+    for (int i = 0; i < n_weights; i++) {
+        GGML_ASSERT(muls[i]->src[0] != weights[i]);
+        GGML_ASSERT(ggml_backend_buffer_get_type(muls[i]->src[0]->buffer) == &backend_device.buffer_type);
+    }
+}
+
 static void run(const char * name, void (*f)()) {
     printf("%s ", name);
     fflush(stdout);
@@ -757,5 +834,6 @@ int main() {
     run("test_reallocation", test_reallocation);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
     run("test_prefetch_staging_slots", test_prefetch_staging_slots);
+    run("test_prefetch_bounded_fusion", test_prefetch_bounded_fusion);
     return 0;
 }
