@@ -17,6 +17,7 @@ uint8_t * const alloc_base = (uint8_t *) 16;
 struct dummy_backend_context {
     size_t max_buffer_size = 64;
     size_t alignment       = 8;
+    bool   is_host         = true;
 
     ggml_backend_buffer_i              buffer_interface;
     ggml_backend_device                device;
@@ -55,8 +56,9 @@ static size_t dummy_backend_buffer_type_get_max_size(ggml_backend_buffer_type_t 
     return ctx->max_buffer_size;
 }
 
-static bool dummy_backend_buffer_type_is_host(ggml_backend_buffer_type_t) {
-    return true;
+static bool dummy_backend_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
+    dummy_backend_context * ctx = (dummy_backend_context *) buft->context;
+    return ctx->is_host;
 }
 
 // ggml_backend_buffer interface
@@ -99,6 +101,13 @@ static bool dummy_backend_device_supports_buft(ggml_backend_dev_t device, ggml_b
     return device->context == buft->context;
 }
 
+// mirror the I/O-heavy ops the accelerator backends offload, so MUL_MAT nodes
+// leave the host weights they read on the host backend and end up on device
+static bool dummy_backend_device_offload_op(ggml_backend_dev_t, const ggml_tensor * op) {
+    return op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID ||
+           op->op == GGML_OP_GET_ROWS || op->op == GGML_OP_OUT_PROD;
+}
+
 // ggml_backend interface
 
 static const char * dummy_backend_get_name(ggml_backend_t) {
@@ -130,6 +139,7 @@ static dummy_backend dummy_backend_init(size_t max_buffer_size, size_t alignment
     b.context->device.iface.get_type      = dummy_backend_device_get_type;
     b.context->device.iface.supports_op   = dummy_backend_device_supports_op;
     b.context->device.iface.supports_buft = dummy_backend_device_supports_buft;
+    b.context->device.iface.offload_op    = dummy_backend_device_offload_op;
 
     b.context->backend.context        = b.context.get();
     b.context->backend.device         = &b.context->device;
@@ -650,6 +660,80 @@ static void test_graph_optimize_alloc_dep() {
     GGML_ASSERT(!graph_reuses_allocation(true));
 }
 
+// Host-resident weights read by two device splits must be staged into two
+// non-overlapping slots of the device prefetch buffer. The device backend has a
+// non-host buffer type, the host backend owns the weights. MUL_MAT ops are
+// offloaded to the device backend, so the weights must be staged across the
+// backends; the host-resident intermediate between the two muls forces the
+// graph into a device/host/device split sequence.
+static void test_prefetch_staging_slots() {
+    dummy_backend backend_device = dummy_backend_init(SIZE_MAX);
+    dummy_backend backend_host   = dummy_backend_init(SIZE_MAX);
+    backend_device.context->is_host = false;
+
+    auto [ctx_x, _x, ctx_x_ptr] = make_context();
+    auto [ctx_w, _w, ctx_w_ptr] = make_context();
+    auto [ctx_h, _h, ctx_h_ptr] = make_context();
+    auto [ctx, graph, ctx_ptr]  = make_context();
+
+    // weights are plain tensors (no INPUT flag on purpose) in a host buffer
+    ggml_tensor * w0 = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, 4, 4);
+    ggml_tensor * w1 = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, 4, 4);
+    ggml_format_name(w0, "w0");
+    ggml_format_name(w1, "w1");
+
+    // activation on the device buffer, plain host intermediate
+    ggml_tensor * x0 = ggml_new_tensor_2d(ctx_x, GGML_TYPE_F32, 4, 1);
+    ggml_tensor * h1 = ggml_new_tensor_2d(ctx_h, GGML_TYPE_F32, 4, 1);
+    ggml_set_input(x0);
+    ggml_set_input(h1);
+    ggml_format_name(x0, "x0");
+    ggml_format_name(h1, "h1");
+
+    ggml_backend_buffer_ptr buf_x(ggml_backend_alloc_ctx_tensors_from_buft(ctx_x, &backend_device.buffer_type));
+    ggml_backend_buffer_ptr buf_w(ggml_backend_alloc_ctx_tensors_from_buft(ctx_w, &backend_host.buffer_type));
+    ggml_backend_buffer_ptr buf_h(ggml_backend_alloc_ctx_tensors_from_buft(ctx_h, &backend_host.buffer_type));
+    GGML_ASSERT(buf_x && buf_w && buf_h);
+    ggml_backend_buffer_set_usage(buf_w.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    // interleaved device/host/device splits, each device split reads one weight
+    ggml_tensor * m0 = ggml_mul_mat(ctx, w0, x0);  // device split, stages w0
+    ggml_tensor * g0 = ggml_add(ctx, w0, h1);      // host split
+    ggml_tensor * m1 = ggml_mul_mat(ctx, w1, x0);  // device split, stages w1
+    ggml_format_name(m0, "m0");
+    ggml_format_name(g0, "g0");
+    ggml_format_name(m1, "m1");
+
+    ggml_set_output(m1);
+    ggml_build_forward_expand(graph, m0);
+    ggml_build_forward_expand(graph, g0);
+    ggml_build_forward_expand(graph, m1);
+    GGML_ASSERT(graph->n_nodes == 3);
+    GGML_ASSERT(graph->n_leafs == 4);
+
+    ggml_backend_t             backend_ptr[2] = { &backend_device.context->backend, &backend_host.context->backend };
+    ggml_backend_buffer_type_t bufts[2]       = { &backend_device.buffer_type, &backend_host.buffer_type };
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(backend_ptr, bufts, 2, 8, false, true));
+    ggml_backend_sched_set_prefetch(sched.get(), true);
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
+
+    // the graph must read the staged copies out of the device prefetch buffer, not the host weights
+    GGML_ASSERT(m0->src[0] != w0);
+    GGML_ASSERT(m1->src[0] != w1);
+    GGML_ASSERT(ggml_backend_buffer_get_type(m0->src[0]->buffer) == &backend_device.buffer_type);
+    GGML_ASSERT(ggml_backend_buffer_get_type(m1->src[0]->buffer) == &backend_device.buffer_type);
+
+    // the two slots must not overlap; with a single weight per split the second
+    // copy is exactly one slot_size away from the first, and reusing the same
+    // slot would alias the two copies at the same address
+    const uint8_t * a0 = (const uint8_t *) m0->src[0]->data;
+    const uint8_t * b0 = (const uint8_t *) m1->src[0]->data;
+    const size_t an = ggml_nbytes(m0->src[0]);
+    const size_t bn = ggml_nbytes(m1->src[0]);
+    GGML_ASSERT(a0 != b0);
+    GGML_ASSERT(b0 >= a0 + an || a0 >= b0 + bn);
+}
+
 static void run(const char * name, void (*f)()) {
     printf("%s ", name);
     fflush(stdout);
@@ -672,5 +756,6 @@ int main() {
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
+    run("test_prefetch_staging_slots", test_prefetch_staging_slots);
     return 0;
 }
