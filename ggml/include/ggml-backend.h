@@ -353,6 +353,13 @@ extern "C" {
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
+    // Enable or disable prefetching of host-resident weight tensors into device memory
+    // during graph compute. Enable it before the graph is split (reserve or alloc) so
+    // the staging buffers are sized for the prefill path. When disabled, the scheduling
+    // is unchanged and host weights are read by the device as before.
+    GGML_API void                 ggml_backend_sched_set_prefetch(ggml_backend_sched_t sched, bool prefetch);
+    GGML_API bool                 ggml_backend_sched_get_prefetch(ggml_backend_sched_t sched);
+
     //
     // Meta backend
     //
