@@ -246,6 +246,7 @@ llama_context::llama_context(
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+    cparams.prefetch_weights = params.prefetch_weights;
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
@@ -1420,6 +1421,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
+        // prefetch host-resident weights into device memory during prefill (n_tokens > 1)
+        ggml_backend_sched_set_prefetch(sched.get(), cparams.prefetch_weights && ubatch.n_tokens > 1);
+
         //const auto t_start_us = ggml_time_us();
 
         gf = model.build_graph(gparams);
@@ -1450,6 +1454,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
+
+    // the graph was built under this prefetch state; graph reuse requires equal n_tokens
+    GGML_ASSERT(ggml_backend_sched_get_prefetch(sched.get()) == (cparams.prefetch_weights && ubatch.n_tokens > 1));
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
@@ -2495,6 +2502,9 @@ ggml_cgraph * llama_context::graph_reserve(
     }
 
     ggml_backend_sched_reset(sched.get());
+
+    // size the prefetch staging buffers whenever the reserved graph is a prefill-size graph
+    ggml_backend_sched_set_prefetch(sched.get(), cparams.prefetch_weights && n_tokens > 1);
 
     // when the scheduler is reset, we cannot reuse old graphs, so we reset the previous graph results
     for (auto & res : gf_res_prev) {
@@ -3724,6 +3734,7 @@ llama_context_params llama_context_default_params() {
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
+        /*.prefetch_weights            =*/ false,
         /*.no_perf                     =*/ true,
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
