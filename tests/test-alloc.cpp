@@ -5,6 +5,8 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <memory>
 #include <vector>
@@ -18,6 +20,8 @@ struct dummy_backend_context {
     size_t max_buffer_size = 64;
     size_t alignment       = 8;
     bool   is_host         = true;
+    enum ggml_backend_dev_type type = GGML_BACKEND_DEVICE_TYPE_CPU;
+    int    allocs_until_fail = 0; // the Nth buffer allocation from now fails, 0 = never
 
     ggml_backend_buffer_i              buffer_interface;
     ggml_backend_device                device;
@@ -41,6 +45,9 @@ static const char * dummy_backend_buffer_type_get_name(ggml_backend_buffer_type_
 
 static ggml_backend_buffer_t dummy_backend_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     dummy_backend_context * ctx    = (dummy_backend_context *) buft->context;
+    if (ctx->allocs_until_fail > 0 && --ctx->allocs_until_fail == 0) {
+        return nullptr;
+    }
     ggml_backend_buffer_t & buffer = ctx->buffers.emplace_back();
     buffer                         = ggml_backend_buffer_init(buft, ctx->buffer_interface, ctx, size);
     return buffer;
@@ -89,8 +96,8 @@ static void dummy_backend_buffer_clear(ggml_backend_buffer_t, uint8_t) {}
 
 // ggml_backend_device interface
 
-static enum ggml_backend_dev_type dummy_backend_device_get_type(ggml_backend_dev_t) {
-    return GGML_BACKEND_DEVICE_TYPE_CPU;
+static enum ggml_backend_dev_type dummy_backend_device_get_type(ggml_backend_dev_t device) {
+    return ((dummy_backend_context *) device->context)->type;
 }
 
 static bool dummy_backend_device_supports_op(ggml_backend_dev_t, const ggml_tensor *) {
@@ -813,6 +820,223 @@ static void test_prefetch_bounded_fusion() {
     }
 }
 
+// A host buffer is pinned for a device when the device's own host buffer type owns it. The dummy host
+// backend's memory stands in for pinned memory once its buffer type is claimed by the device.
+static void test_buffer_is_pinned() {
+    dummy_backend backend_device = dummy_backend_init(SIZE_MAX);
+    dummy_backend backend_host   = dummy_backend_init(SIZE_MAX);
+    backend_device.context->is_host = false;
+    backend_device.context->type    = GGML_BACKEND_DEVICE_TYPE_GPU;
+
+    ggml_backend_buffer_type pinned_buft = backend_host.buffer_type;
+    pinned_buft.device = &backend_device.context->device;
+
+    ggml_backend_dev_t dev_device = &backend_device.context->device;
+    ggml_backend_dev_t dev_host   = &backend_host.context->device;
+
+    ggml_backend_buffer_ptr buf_pinned(ggml_backend_buft_alloc_buffer(&pinned_buft, 64));
+    ggml_backend_buffer_ptr buf_plain (ggml_backend_buft_alloc_buffer(&backend_host.buffer_type, 64));
+    ggml_backend_buffer_ptr buf_device(ggml_backend_buft_alloc_buffer(&backend_device.buffer_type, 64));
+    GGML_ASSERT(buf_pinned && buf_plain && buf_device);
+
+    GGML_ASSERT( ggml_backend_buffer_is_pinned(buf_pinned.get(), dev_device));
+    GGML_ASSERT(!ggml_backend_buffer_is_pinned(buf_pinned.get(), dev_host));   // the CPU has nothing to pin for
+    GGML_ASSERT(!ggml_backend_buffer_is_pinned(buf_plain.get(),  dev_device)); // plain CPU memory
+    GGML_ASSERT(!ggml_backend_buffer_is_pinned(buf_device.get(), dev_device)); // not host memory
+    GGML_ASSERT(!ggml_backend_buffer_is_pinned(nullptr, dev_device));
+}
+
+// MoE prefill with the expert tensors in host memory: three consecutive MUL_MAT_ID nodes (gate, up, down)
+// offloaded to the device, one split each. Experts pinned by the device are staged in full through the
+// prefetch slots when the batch routes to nearly every expert, everything else takes the stock copy path.
+struct moe_prefetch_graph {
+    static constexpr int n_nodes  = 3;
+    static constexpr int n_expert = 8;
+    static constexpr int n_used   = 2;
+
+    dummy_backend backend_device = dummy_backend_init(SIZE_MAX);
+    dummy_backend backend_host   = dummy_backend_init(SIZE_MAX);
+    ggml_backend_buffer_type pinned_buft = {};
+
+    test_context_with_graph w   = make_context();
+    test_context_with_graph act = make_context();
+    test_context_with_graph g   = make_context();
+
+    ggml_backend_buffer_ptr buf_w;
+    ggml_backend_buffer_ptr buf_act;
+    ggml_tensor * weights[n_nodes];
+    ggml_tensor * x;
+    ggml_tensor * ids;
+    ggml_tensor * mm[n_nodes];
+
+    moe_prefetch_graph(bool pinned, int n_tokens) {
+        backend_device.context->is_host = false;
+        backend_device.context->type    = GGML_BACKEND_DEVICE_TYPE_GPU;
+        pinned_buft        = backend_host.buffer_type;
+        pinned_buft.device = &backend_device.context->device;
+
+        for (int i = 0; i < n_nodes; i++) {
+            weights[i] = ggml_new_tensor_3d(w.ctx, GGML_TYPE_F32, 4, 4, n_expert);
+            ggml_format_name(weights[i], "exps%d", i);
+        }
+        x   = ggml_new_tensor_3d(act.ctx, GGML_TYPE_F32, 4, 1, n_tokens);
+        ids = ggml_new_tensor_2d(act.ctx, GGML_TYPE_I32, n_used, n_tokens);
+        ggml_set_input(x);
+        ggml_set_input(ids);
+        ggml_format_name(x, "x");
+        ggml_format_name(ids, "ids");
+
+        buf_w.reset(ggml_backend_alloc_ctx_tensors_from_buft(w.ctx, pinned ? &pinned_buft : &backend_host.buffer_type));
+        buf_act.reset(ggml_backend_alloc_ctx_tensors_from_buft(act.ctx, &backend_device.buffer_type));
+        GGML_ASSERT(buf_w && buf_act);
+        ggml_backend_buffer_set_usage(buf_w.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+        build_graph(g, mm);
+    }
+
+    // a graph over the same weights; the scheduler rewrites the nodes of a graph in place, so
+    // evaluating the same situation twice needs a fresh one
+    void build_graph(test_context_with_graph & gg, ggml_tensor * (&out)[n_nodes]) const {
+        ggml_tensor * cur = x;
+        for (int i = 0; i < n_nodes; i++) {
+            cur = out[i] = ggml_mul_mat_id(gg.ctx, weights[i], cur, ids);
+            ggml_format_name(cur, "mm%d", i);
+        }
+        ggml_set_output(cur);
+        ggml_build_forward_expand(gg.graph, cur);
+        GGML_ASSERT(gg.graph->n_nodes == n_nodes);
+    }
+
+    ggml_backend_sched_ptr make_sched() {
+        ggml_backend_t             backends[2] = { &backend_device.context->backend, &backend_host.context->backend };
+        ggml_backend_buffer_type_t bufts[2]    = { &backend_device.buffer_type, &backend_host.buffer_type };
+        ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 2, 64, false, true));
+        ggml_backend_sched_set_prefetch(sched.get(), true);
+        return sched;
+    }
+
+    // every expert tensor is read through a device copy, staged or not
+    void check_on_device() const {
+        for (int i = 0; i < n_nodes; i++) {
+            GGML_ASSERT(mm[i]->src[0] != weights[i]);
+            GGML_ASSERT(ggml_backend_buffer_get_type(mm[i]->src[0]->buffer) == &backend_device.buffer_type);
+        }
+    }
+    static bool staged(const ggml_tensor * mmid) {
+        const char * name = mmid->src[0]->name;
+        const size_t n = strlen(name);
+        return n >= 3 && strcmp(name + n - 3, "#pf") == 0;
+    }
+    bool staged(int i) const {
+        return staged(mm[i]);
+    }
+};
+
+static void test_prefetch_moe_pinned_experts() {
+    moe_prefetch_graph m(/*pinned=*/true, /*n_tokens=*/16); // 32 routes for 8 experts
+    ggml_backend_sched_ptr sched = m.make_sched();
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), m.g.graph));
+    GGML_ASSERT(ggml_backend_sched_get_n_splits(sched.get()) == m.n_nodes);
+
+    m.check_on_device();
+    for (int i = 0; i < m.n_nodes; i++) {
+        GGML_ASSERT(m.staged(i));
+    }
+
+    // consecutive tensors alternate between two slots and never overlap; the third reuses the first slot
+    const uint8_t * p[m.n_nodes];
+    for (int i = 0; i < m.n_nodes; i++) {
+        p[i] = (const uint8_t *) m.mm[i]->src[0]->data;
+    }
+    const size_t n = ggml_nbytes(m.mm[0]->src[0]);
+    GGML_ASSERT(p[1] >= p[0] + n || p[0] >= p[1] + n);
+    GGML_ASSERT(p[2] >= p[1] + n || p[1] >= p[2] + n);
+    GGML_ASSERT(p[0] == p[2]);
+}
+
+// experts in plain CPU memory are left to the selective copy of the stock path
+static void test_prefetch_moe_unpinned_experts() {
+    moe_prefetch_graph m(/*pinned=*/false, /*n_tokens=*/16);
+    ggml_backend_sched_ptr sched = m.make_sched();
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), m.g.graph));
+
+    m.check_on_device();
+    for (int i = 0; i < m.n_nodes; i++) {
+        GGML_ASSERT(!m.staged(i));
+    }
+}
+
+// below two routes per expert the batch leaves experts unused, so the selective copy still saves traffic
+static void test_prefetch_moe_small_batch() {
+    moe_prefetch_graph m(/*pinned=*/true, /*n_tokens=*/4); // 8 routes for 8 experts
+    ggml_backend_sched_ptr sched = m.make_sched();
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), m.g.graph));
+
+    m.check_on_device();
+    for (int i = 0; i < m.n_nodes; i++) {
+        GGML_ASSERT(!m.staged(i));
+    }
+}
+
+static void set_env(const char * name, const char * value) {
+#ifdef _WIN32
+    _putenv_s(name, value ? value : ""); // an empty value removes the variable
+#else
+    if (value) {
+        setenv(name, value, 1);
+    } else {
+        unsetenv(name);
+    }
+#endif
+}
+
+// staging that exceeds the slot limit must leave a valid graph: the weights fall back to the stock copies
+static void test_prefetch_moe_slot_limit() {
+    moe_prefetch_graph m(/*pinned=*/true, /*n_tokens=*/16);
+    set_env("GGML_SCHED_PREFETCH_MAX_SLOT_MB", "0");
+    ggml_backend_sched_ptr sched = m.make_sched();
+    set_env("GGML_SCHED_PREFETCH_MAX_SLOT_MB", nullptr);
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), m.g.graph));
+
+    m.check_on_device();
+    for (int i = 0; i < m.n_nodes; i++) {
+        GGML_ASSERT(!m.staged(i));
+    }
+}
+
+// a staging buffer that cannot be allocated must not leave the graph pointing at host weights
+static void test_prefetch_moe_alloc_failure() {
+    moe_prefetch_graph m(/*pinned=*/true, /*n_tokens=*/16);
+    ggml_backend_sched_ptr sched = m.make_sched();
+    m.backend_device.context->allocs_until_fail = 1; // the staging buffer is the first device allocation
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), m.g.graph));
+
+    m.check_on_device();
+    for (int i = 0; i < m.n_nodes; i++) {
+        GGML_ASSERT(!m.staged(i));
+    }
+}
+
+// a staging request that was refused is not retried by the next graph, so the outcome and the report
+// do not depend on how many times the graph happens to be rebuilt
+static void test_prefetch_moe_refusal_is_sticky() {
+    moe_prefetch_graph m(/*pinned=*/true, /*n_tokens=*/16);
+    ggml_backend_sched_ptr sched = m.make_sched();
+    m.backend_device.context->allocs_until_fail = 1;
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), m.g.graph));
+    GGML_ASSERT(!m.staged(0));
+
+    ggml_backend_sched_reset(sched.get());
+    ggml_backend_sched_set_prefetch(sched.get(), true);
+    test_context_with_graph g2 = make_context();
+    ggml_tensor * mm2[m.n_nodes];
+    m.build_graph(g2, mm2);
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), g2.graph)); // allocations succeed again now
+    for (int i = 0; i < m.n_nodes; i++) {
+        GGML_ASSERT(!m.staged(mm2[i]));
+    }
+}
+
 static void run(const char * name, void (*f)()) {
     printf("%s ", name);
     fflush(stdout);
@@ -837,5 +1061,12 @@ int main() {
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
     run("test_prefetch_staging_slots", test_prefetch_staging_slots);
     run("test_prefetch_bounded_fusion", test_prefetch_bounded_fusion);
+    run("test_buffer_is_pinned", test_buffer_is_pinned);
+    run("test_prefetch_moe_pinned_experts", test_prefetch_moe_pinned_experts);
+    run("test_prefetch_moe_unpinned_experts", test_prefetch_moe_unpinned_experts);
+    run("test_prefetch_moe_small_batch", test_prefetch_moe_small_batch);
+    run("test_prefetch_moe_slot_limit", test_prefetch_moe_slot_limit);
+    run("test_prefetch_moe_alloc_failure", test_prefetch_moe_alloc_failure);
+    run("test_prefetch_moe_refusal_is_sticky", test_prefetch_moe_refusal_is_sticky);
     return 0;
 }

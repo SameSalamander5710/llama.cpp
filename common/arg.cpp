@@ -1683,7 +1683,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_UBATCH"));
     add_opt(common_arg(
         {"-pw", "--prefetch-weights"}, "0|1",
-        string_format("prefetch host-resident weights into device memory during prefill (default: %d)", params.prefetch_weights),
+        string_format("prefetch host-resident weights into device memory during prefill; MoE experts are prefetched\n"
+                      "when pinned in the device's host buffer, e.g. -ot exps=Vulkan_Host (default: %d)", params.prefetch_weights),
         [](common_params & params, int value) {
             params.prefetch_weights = value != 0;
         }

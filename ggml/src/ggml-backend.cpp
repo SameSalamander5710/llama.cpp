@@ -184,6 +184,16 @@ bool ggml_backend_buffer_is_host(ggml_backend_buffer_t buffer) {
     return ggml_backend_buft_is_host(ggml_backend_buffer_get_type(buffer));
 }
 
+bool ggml_backend_buffer_is_pinned(ggml_backend_buffer_t buffer, ggml_backend_dev_t dev) {
+    if (buffer == NULL || dev == NULL || !ggml_backend_buffer_is_host(buffer)) {
+        return false;
+    }
+    // the host buffer types of the accelerator backends belong to that backend's device;
+    // plain CPU buffer types belong to the CPU device, which has nothing to pin for
+    return ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU &&
+           ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buffer)) == dev;
+}
+
 void ggml_backend_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage) {
     GGML_ASSERT(buffer);
     buffer->usage = usage;
@@ -772,6 +782,13 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #define GGML_SCHED_MAX_COPIES 4
 #endif
 
+// MoE expert weights are staged in full instead of copying only the routed experts once the batch routes
+// at least this many (token, expert) pairs per expert: virtually every expert is then used anyway, and the
+// selective copy pays for reading the ids back to the host and a device sync per expert tensor for nothing
+#ifndef GGML_SCHED_PREFETCH_MOE_ROUTES_PER_EXPERT
+#define GGML_SCHED_PREFETCH_MOE_ROUTES_PER_EXPERT 2
+#endif
+
 struct ggml_backend_sched_split {
     int backend_id;
     int i_start;
@@ -856,6 +873,10 @@ struct ggml_backend_sched {
     bool prefetch;
     struct ggml_backend_buffer * prefetch_buffers[GGML_SCHED_MAX_BACKENDS];
     size_t prefetch_slot_size[GGML_SCHED_MAX_BACKENDS];
+    // largest staging slot allowed (GGML_SCHED_PREFETCH_MAX_SLOT_MB); weights that need more take the stock copy path
+    size_t prefetch_slot_limit;
+    // smallest staging buffer that was refused per backend (0 = none), so it is not retried or reported again
+    size_t prefetch_alloc_failed[GGML_SCHED_MAX_BACKENDS];
     size_t prefetch_slot_pack[GGML_SCHED_MAX_BACKENDS][2];
     int prefetch_slot_cursor[GGML_SCHED_MAX_BACKENDS];
     ggml_backend_event_t compute_events[GGML_SCHED_MAX_BACKENDS][2];
@@ -942,6 +963,23 @@ static void ggml_backend_sched_prefetch_rewrites_grow(ggml_backend_sched_t sched
     }
 }
 
+// MoE expert weights (src0 of MUL_MAT_ID) are staged in full, ahead of the node, when they sit in memory
+// pinned by the split's device and the batch routes to nearly every expert. The pinned memory is what makes
+// the upload a plain DMA; from pageable memory the device backends bounce every copy through a staging
+// buffer and synchronize per tensor, so those experts stay on the stock path. The verdict depends on
+// shapes only, so it is the same for every eval of a graph.
+static bool ggml_backend_sched_prefetch_experts_candidate(
+        ggml_backend_sched_t sched, struct ggml_tensor * src, struct ggml_tensor * node, int backend_id, ggml_backend_buffer_t buf) {
+    if (src != node->src[0]) {
+        return false;
+    }
+    if (!ggml_backend_buffer_is_pinned(buf, ggml_backend_get_device(sched->backends[backend_id]))) {
+        return false;
+    }
+    const struct ggml_tensor * ids = node->src[2];
+    return ids != NULL && ids->ne[0]*ids->ne[1] >= GGML_SCHED_PREFETCH_MOE_ROUTES_PER_EXPERT*src->ne[2];
+}
+
 // returns true if a cross-backend host-resident weight should be staged into device
 // memory on backend_id instead of taking the stock copy path; the caller has already
 // established that the weight is not supported by the split's backend
@@ -951,10 +989,6 @@ static bool ggml_backend_sched_prefetch_candidate(
         return false;
     }
     if (backend_id < 0 || backend_id >= sched->n_backends) {
-        return false;
-    }
-    // never prefetch through the selective-expert copy path
-    if (node->op == GGML_OP_MUL_MAT_ID) {
         return false;
     }
     if (src->flags & GGML_TENSOR_FLAG_INPUT) {
@@ -973,6 +1007,9 @@ static bool ggml_backend_sched_prefetch_candidate(
     // staging into a host buffer only adds a copy, so skip host buffer types
     if (sched->bufts[backend_id] == NULL || ggml_backend_buft_is_host(sched->bufts[backend_id])) {
         return false;
+    }
+    if (node->op == GGML_OP_MUL_MAT_ID) {
+        return ggml_backend_sched_prefetch_experts_candidate(sched, src, node, backend_id, buf);
     }
     return true;
 }
@@ -1162,6 +1199,68 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
         *node_backend_id = cur_backend_id;
         SET_CAUSE(node, "2.sup");
     }
+}
+
+// registers src as an input of the split, to be copied to backend_id by ggml_backend_sched_compute_splits
+// before the split runs (the stock path); the per-backend copies are created once per tensor
+static void ggml_backend_sched_split_add_input(
+        ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * src, size_t src_id, int backend_id) {
+    if (tensor_id_copy(src_id, backend_id, 0) != NULL) {
+        return;
+    }
+    ggml_backend_t backend = sched->backends[backend_id];
+    for (int c = 0; c < sched->n_copies; c++) {
+        struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
+        ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
+        if (sched->n_copies > 1) {
+            ggml_set_input(tensor_copy);
+            ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
+        }
+        tensor_id_copy(src_id, backend_id, c) = tensor_copy;
+        SET_CAUSE(tensor_copy, "4.cpy");
+    }
+    int n_inputs = split->n_inputs++;
+    if (n_inputs >= split->inputs_capacity) {
+        ggml_backend_sched_split_inputs_grow(split);
+    }
+    split->inputs[n_inputs] = src;
+}
+
+// makes sure backend b owns a staging buffer of two slots of at least slot_size bytes. Returns false when
+// the slots are over the limit or cannot be allocated: the caller then leaves the weights of this backend
+// to the stock copy path for this graph rather than binding them to memory that does not exist
+static bool ggml_backend_sched_prefetch_ensure_staging(ggml_backend_sched_t sched, int b, size_t slot_size) {
+    if (sched->prefetch_buffers[b] != NULL && sched->prefetch_slot_size[b] >= slot_size) {
+        return true;
+    }
+    if (sched->prefetch_alloc_failed[b] != 0 && 2*slot_size >= sched->prefetch_alloc_failed[b]) {
+        return false;
+    }
+    const char * reason = NULL;
+    if (slot_size > sched->prefetch_slot_limit) {
+        reason = "over the slot limit (GGML_SCHED_PREFETCH_MAX_SLOT_MB)";
+    } else if (2*slot_size > ggml_backend_buft_get_max_size(sched->bufts[b])) {
+        reason = "over the maximum buffer size";
+    } else {
+        if (sched->prefetch_buffers[b] != NULL) {
+            ggml_backend_synchronize(sched->backends[b]);
+            ggml_backend_buffer_free(sched->prefetch_buffers[b]);
+            sched->prefetch_buffers[b] = NULL;
+            sched->prefetch_slot_size[b] = 0;
+        }
+        sched->prefetch_buffers[b] = ggml_backend_buft_alloc_buffer(sched->bufts[b], 2*slot_size);
+        if (sched->prefetch_buffers[b] != NULL) {
+            sched->prefetch_slot_size[b] = slot_size;
+            GGML_LOG_INFO("%s: prefetch buffer for backend %s: 2 x %s\n",
+                    __func__, ggml_backend_name(sched->backends[b]), fmt_size(slot_size));
+            return true;
+        }
+        reason = "allocation failed";
+    }
+    GGML_LOG_WARN("%s: not prefetching weights on backend %s, 2 x %s of staging is not possible: %s\n",
+            __func__, ggml_backend_name(sched->backends[b]), fmt_size(slot_size), reason);
+    sched->prefetch_alloc_failed[b] = 2*slot_size;
+    return false;
 }
 
 // debug: abort if a fire's destination range overlaps the other, in-flight slot's last
@@ -1643,24 +1742,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         sched->prefetch_rewrites[r].slot = slot;
                     } else {
                         // create a copy of the input in the split's backend
-                        if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
-                            ggml_backend_t backend = sched->backends[cur_backend_id];
-                            for (int c = 0; c < sched->n_copies; c++) {
-                                struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
-                                ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
-                                if (sched->n_copies > 1) {
-                                    ggml_set_input(tensor_copy);
-                                    ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
-                                }
-                                tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
-                                SET_CAUSE(tensor_copy, "4.cpy");
-                            }
-                            int n_inputs = split->n_inputs++;
-                            if (n_inputs >= split->inputs_capacity) {
-                                ggml_backend_sched_split_inputs_grow(split);
-                            }
-                            split->inputs[n_inputs] = src;
-                        }
+                        ggml_backend_sched_split_add_input(sched, split, src, src_id, cur_backend_id);
                         node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
                     }
                 }
@@ -1693,46 +1775,27 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         }
         for (int b = 0; b < sched->n_backends; b++) {
             // size of the two slots from the copies observed in this graph
-            const size_t max_pack = std::max(sched->prefetch_slot_pack[b][0], sched->prefetch_slot_pack[b][1]);
-            if (max_pack == 0) {
-                continue;
-            }
-            // stop and report when the staging grows past 1 GiB per slot - the host
-            // weight selection is wrong in that case
-            const size_t slot_limit = (size_t) 1 << 30;
-            if (max_pack > slot_limit) {
-                GGML_LOG_ERROR("%s: prefetch staging for backend %s needs %zuM per slot, disabling\n",
-                        __func__, ggml_backend_name(sched->backends[b]), max_pack/1024/1024);
-                continue;
-            }
+            const size_t max_pack  = std::max(sched->prefetch_slot_pack[b][0], sched->prefetch_slot_pack[b][1]);
             const size_t alignment = ggml_backend_buft_get_alignment(sched->bufts[b]);
             const size_t slot_size = (max_pack + alignment - 1) & ~(alignment - 1);
-            if (sched->prefetch_buffers[b] == NULL || sched->prefetch_slot_size[b] < slot_size) {
-                if (sched->prefetch_buffers[b] != NULL) {
-                    ggml_backend_synchronize(sched->backends[b]);
-                    ggml_backend_buffer_free(sched->prefetch_buffers[b]);
-                    sched->prefetch_buffers[b] = NULL;
-                }
-                sched->prefetch_buffers[b] = ggml_backend_buft_alloc_buffer(sched->bufts[b], 2*slot_size);
-                if (sched->prefetch_buffers[b] == NULL) {
-                    GGML_LOG_ERROR("%s: failed to allocate prefetch buffer of %zu bytes for backend %s, disabling\n",
-                            __func__, 2*slot_size, ggml_backend_name(sched->backends[b]));
-                    continue;
-                }
-                sched->prefetch_slot_size[b] = slot_size;
-                GGML_LOG_INFO("%s: prefetch buffer for backend %s: 2 x %s\n",
-                        __func__, ggml_backend_name(sched->backends[b]), fmt_size(slot_size));
-            }
+            // without a staging buffer the weights of this backend take the stock copy path
+            const bool staged = max_pack > 0 && ggml_backend_sched_prefetch_ensure_staging(sched, b, slot_size);
 
             // bind the staged copies and rewire the consuming nodes
             ggml_backend_buffer_t buf = sched->prefetch_buffers[b];
-            void * base = ggml_backend_buffer_get_base(buf);
+            void * base = staged ? ggml_backend_buffer_get_base(buf) : NULL;
             for (int r = 0; r < sched->n_prefetch_rewrites; r++) {
                 struct ggml_backend_sched_prefetch_rewrite * rw = &sched->prefetch_rewrites[r];
                 if (rw->backend_id != b) {
                     continue;
                 }
                 struct ggml_tensor * src = rw->node->src[rw->src_idx];
+                if (!staged) {
+                    const size_t src_id = hash_id(src);
+                    ggml_backend_sched_split_add_input(sched, &sched->splits[rw->split_id], src, src_id, b);
+                    rw->node->src[rw->src_idx] = tensor_id_copy(src_id, b, sched->cur_copy);
+                    continue;
+                }
                 const size_t idx = ggml_backend_sched_prefetch_stage_idx(hash_id(src), b, sched->n_backends, rw->slot);
                 struct ggml_tensor * copy = sched->prefetch_staged[idx];
                 if (copy == NULL) {
@@ -2223,6 +2286,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->debug = GGML_SCHED_DEBUG ? atoi(GGML_SCHED_DEBUG) : 0;
     const char * GGML_SCHED_DEBUG_PREFETCH = getenv("GGML_SCHED_DEBUG_PREFETCH");
     sched->debug_prefetch = GGML_SCHED_DEBUG_PREFETCH ? atoi(GGML_SCHED_DEBUG_PREFETCH) : 0;
+    // one staging slot holds the largest weight streamed in a split; a MoE expert tensor is often several
+    // hundred MiB and two slots are resident at once, so the limit is a knob rather than a constant
+    const char * GGML_SCHED_PREFETCH_MAX_SLOT_MB = getenv("GGML_SCHED_PREFETCH_MAX_SLOT_MB");
+    sched->prefetch_slot_limit = (size_t) std::max<long long>(0, GGML_SCHED_PREFETCH_MAX_SLOT_MB ? atoll(GGML_SCHED_PREFETCH_MAX_SLOT_MB) : 2048) << 20;
 
     sched->debug_realloc = 0;
 #ifdef GGML_SCHED_NO_REALLOC

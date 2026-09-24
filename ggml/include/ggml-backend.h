@@ -62,6 +62,9 @@ extern "C" {
     GGML_API size_t                         ggml_backend_buffer_get_alloc_size(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor);
     GGML_API void                           ggml_backend_buffer_clear         (ggml_backend_buffer_t buffer, uint8_t value);
     GGML_API bool                           ggml_backend_buffer_is_host       (ggml_backend_buffer_t buffer);
+    // true if buffer is host memory pinned by dev itself (e.g. Vulkan_Host, CUDA_Host): dev can DMA from it
+    // directly, unlike plain CPU memory (CPU, CPU_Mapped) which it has to stage through a bounce buffer
+    GGML_API bool                           ggml_backend_buffer_is_pinned     (ggml_backend_buffer_t buffer, ggml_backend_dev_t dev);
     GGML_API void                           ggml_backend_buffer_set_usage     (ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage);
     GGML_API enum ggml_backend_buffer_usage ggml_backend_buffer_get_usage     (ggml_backend_buffer_t buffer);
     GGML_API ggml_backend_buffer_type_t     ggml_backend_buffer_get_type      (ggml_backend_buffer_t buffer);
