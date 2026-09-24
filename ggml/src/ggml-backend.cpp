@@ -1502,7 +1502,13 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         split->n_prefetch = 0;
         split->prefetch_slot = -1;
         split->prefetch_pack = 0;
-        const int prefetch_max_lookahead = 8;
+        // Vulkan's non-pinned set_tensor_async fallback calls ggml_vk_synchronize
+        // once per tensor, which waits on the compute fence. Fusing several streamed
+        // weights into one split exposes the tail copies as serial DMA (only the
+        // first copy in a split can overlap the previous split's compute; the rest
+        // stall with the GPU idle). Keep one streamed weight per split so each
+        // copy can be hidden under the previous split's compute.
+        const int prefetch_max_lookahead = 1;
         size_t split_pack = 0;
         int n_prefetch_nodes = 0;
         int cur_backend_id = split->backend_id;

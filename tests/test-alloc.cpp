@@ -742,8 +742,10 @@ static void test_prefetch_staging_slots() {
 // max_lookahead boundary.
 static void test_prefetch_bounded_fusion() {
     const int n_weights      = 20;
-    const int max_lookahead  = 8;
-    const int expected_splits = (n_weights + max_lookahead - 1) / max_lookahead; // ceil(20/8) = 3
+    // max_lookahead=1: one streamed weight per split, so each DMA can overlap
+    // the previous split's compute via the compute-fence in set_tensor_async.
+    const int max_lookahead  = 1;
+    const int expected_splits = (n_weights + max_lookahead - 1) / max_lookahead; // ceil(20/1) = 20
 
     dummy_backend backend_device = dummy_backend_init(SIZE_MAX);
     dummy_backend backend_host   = dummy_backend_init(SIZE_MAX);
