@@ -1011,7 +1011,9 @@ static bool ggml_backend_sched_prefetch_candidate(
     if (node->op == GGML_OP_MUL_MAT_ID) {
         return ggml_backend_sched_prefetch_experts_candidate(sched, src, node, backend_id, buf);
     }
-    return true;
+    // only stage weights whose host memory the consuming device can DMA without a bounce;
+    // the split-fusion lookahead below must not engage for unpinned host weights
+    return ggml_backend_buffer_is_pinned(buf, ggml_backend_get_device(sched->backends[backend_id]));
 }
 
 // returns the priority of the backend, lower id is higher priority
