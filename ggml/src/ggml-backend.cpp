@@ -1231,6 +1231,16 @@ static void ggml_backend_sched_split_add_input(
 // makes sure backend b owns a staging buffer of two slots of at least slot_size bytes. Returns false when
 // the slots are over the limit or cannot be allocated: the caller then leaves the weights of this backend
 // to the stock copy path for this graph rather than binding them to memory that does not exist
+// a split packs into one staging slot and the staging buffer holds two of them, so a
+// split can only pack what the buffer can hold. A slot over that limit makes
+// ggml_backend_sched_prefetch_ensure_staging refuse the whole backend, which drops the
+// weights of this backend to the stock copy path and loses the prefetch entirely.
+static size_t ggml_backend_sched_prefetch_pack_limit(ggml_backend_sched_t sched, int b) {
+    const size_t alignment = ggml_backend_buft_get_alignment(sched->bufts[b]);
+    const size_t half      = ggml_backend_buft_get_max_size(sched->bufts[b]) / 2;
+    return std::min(sched->prefetch_slot_limit, half > alignment ? half - alignment : 0);
+}
+
 static bool ggml_backend_sched_prefetch_ensure_staging(ggml_backend_sched_t sched, int b, size_t slot_size) {
     if (sched->prefetch_buffers[b] != NULL && sched->prefetch_slot_size[b] >= slot_size) {
         return true;
@@ -1613,6 +1623,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         // of serializing one DMA per split behind a near-instant matmul.
         size_t split_pack = 0;
         int cur_backend_id = split->backend_id;
+        const size_t pack_limit = ggml_backend_sched_prefetch_pack_limit(sched, cur_backend_id);
         for (; i < graph->n_nodes; i++) {
             struct ggml_tensor * node = graph->nodes[i];
 
@@ -1668,7 +1679,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                                     const size_t alignment = ggml_backend_buft_get_alignment(sched->bufts[cur_backend_id]);
                                     const size_t size       = ggml_backend_buft_get_alloc_size(sched->bufts[cur_backend_id], src);
                                     const size_t offset     = (split_pack_projected + alignment - 1) & ~(alignment - 1);
-                                    fits_slot = (offset + size) <= sched->prefetch_slot_limit;
+                                    fits_slot = (offset + size) <= pack_limit;
                                     if (fits_slot) {
                                         split_pack_projected = offset + size;
                                     }

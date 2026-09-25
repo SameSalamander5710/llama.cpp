@@ -924,6 +924,65 @@ static void test_prefetch_byte_budget_split() {
     }
 }
 
+// The two staging slots share one buffer, so a split must pack no more than the buffer
+// can hold, whatever the slot limit says: a slot over that makes the scheduler drop this
+// backend to the stock copy path and prefetch stops. A 1 MiB device buffer holds one
+// 384 KiB weight per slot but not two, so the 4 weights must split in four even though
+// the slot limit would take all of them.
+static void test_prefetch_pack_fits_staging_buffer() {
+    const int n_weights = 4;
+
+    dummy_backend backend_device = dummy_backend_init(1024*1024);
+    dummy_backend backend_host   = dummy_backend_init(SIZE_MAX);
+    backend_device.context->is_host = false;
+    backend_device.context->type    = GGML_BACKEND_DEVICE_TYPE_GPU;
+
+    ggml_backend_buffer_type pinned_buft = backend_host.buffer_type;
+    pinned_buft.device = &backend_device.context->device;
+
+    auto [ctx_w, _w, ctx_w_ptr] = make_context();
+    auto [ctx_x, _x, ctx_x_ptr] = make_context();
+    auto [ctx,   graph, ctx_ptr] = make_context();
+
+    std::vector<ggml_tensor *> weights(n_weights);
+    for (int i = 0; i < n_weights; i++) {
+        weights[i] = ggml_new_tensor_3d(ctx_w, GGML_TYPE_F32, 4, 4, 6144);
+        ggml_format_name(weights[i], "w%d", i);
+    }
+
+    ggml_tensor * x = ggml_new_tensor_3d(ctx_x, GGML_TYPE_F32, 4, 1, 6144);
+    ggml_set_input(x);
+    ggml_format_name(x, "x");
+
+    ggml_backend_buffer_ptr buf_x(ggml_backend_alloc_ctx_tensors_from_buft(ctx_x, &backend_device.buffer_type));
+    ggml_backend_buffer_ptr buf_w(ggml_backend_alloc_ctx_tensors_from_buft(ctx_w, &pinned_buft));
+    GGML_ASSERT(buf_x && buf_w);
+    ggml_backend_buffer_set_usage(buf_w.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    std::vector<ggml_tensor *> muls(n_weights);
+    for (int i = 0; i < n_weights; i++) {
+        muls[i] = ggml_mul_mat(ctx, weights[i], x);
+        ggml_format_name(muls[i], "m%d", i);
+        ggml_set_output(muls[i]);
+        ggml_build_forward_expand(graph, muls[i]);
+    }
+
+    ggml_backend_t             backend_ptr[2] = { &backend_device.context->backend, &backend_host.context->backend };
+    ggml_backend_buffer_type_t bufts[2]       = { &backend_device.buffer_type, &backend_host.buffer_type };
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(backend_ptr, bufts, 2, 64, false, true));
+    ggml_backend_sched_set_prefetch(sched.get(), true);
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
+
+    // the buffer bounds the pack, not the slot limit
+    GGML_ASSERT(ggml_backend_sched_get_n_splits(sched.get()) == n_weights);
+
+    // and the weights still reach the device through a staged copy
+    for (int i = 0; i < n_weights; i++) {
+        GGML_ASSERT(muls[i]->src[0] != weights[i]);
+        GGML_ASSERT(ggml_backend_buffer_get_type(muls[i]->src[0]->buffer) == &backend_device.buffer_type);
+    }
+}
+
 // A host buffer is pinned for a device when the device's own host buffer type owns it. The dummy host
 // backend's memory stands in for pinned memory once its buffer type is claimed by the device.
 static void test_buffer_is_pinned() {
@@ -1157,6 +1216,7 @@ int main() {
     run("test_prefetch_staging_slots", test_prefetch_staging_slots);
     run("test_prefetch_bounded_fusion", test_prefetch_bounded_fusion);
     run("test_prefetch_byte_budget_split", test_prefetch_byte_budget_split);
+    run("test_prefetch_pack_fits_staging_buffer", test_prefetch_pack_fits_staging_buffer);
     run("test_buffer_is_pinned", test_buffer_is_pinned);
     run("test_prefetch_moe_pinned_experts", test_prefetch_moe_pinned_experts);
     run("test_prefetch_moe_unpinned_experts", test_prefetch_moe_unpinned_experts);
