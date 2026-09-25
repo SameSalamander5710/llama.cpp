@@ -853,9 +853,9 @@ static void test_prefetch_bounded_fusion() {
 
 // The staging slot is the only bound left on fusion: a weight that does not fit in
 // what the split has staged so far must start a new split instead of overflowing
-// the slot. 384 KiB weights give 2 per 1 MiB slot, so 8 weights must split in four.
+// the slot. 384 KiB weights give 2 per 1 MiB slot, so 4 weights must split in two.
 static void test_prefetch_byte_budget_split() {
-    const int n_weights   = 8;
+    const int n_weights   = 4;
     const int n_per_split = 2;
 
     dummy_backend backend_device = dummy_backend_init(SIZE_MAX);

@@ -822,9 +822,60 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
     }
 }
 
+// The allocation pass hashes every tensor the graph reaches, not only its nodes and leafs:
+// views hash their source, and the scheduler can replace a source with a copy. Count the
+// distinct tensors up front, so the table is sized from the graph instead of from a fixed
+// margin that a small graph with substituted sources outgrows. The count runs in its own set
+// because the table of the galloc must not change while it holds the entries of a graph.
+static size_t ggml_gallocr_count_tensor(struct ggml_hash_set * set, struct ggml_tensor * t) {
+    if (t == NULL || ggml_hash_contains(set, t)) {
+        return 0;
+    }
+
+    if (ggml_hash_find(set, t) == GGML_HASHSET_FULL) {
+        struct ggml_hash_set grown = ggml_hash_set_new(set->size + 1);
+        GGML_ASSERT(grown.keys != NULL);
+        for (size_t i = 0; i < set->size; i++) {
+            if (ggml_bitset_get(set->used, i)) {
+                ggml_hash_insert(&grown, set->keys[i]);
+            }
+        }
+        ggml_hash_set_free(set);
+        *set = grown;
+    }
+
+    ggml_hash_insert(set, t);
+
+    if (ggml_impl_is_view(t)) {
+        return 1 + ggml_gallocr_count_tensor(set, t->view_src);
+    }
+
+    return 1;
+}
+
+static size_t ggml_gallocr_count_tensors(struct ggml_cgraph * graph) {
+    struct ggml_hash_set set = ggml_hash_set_new(graph->n_nodes + graph->n_leafs);
+    GGML_ASSERT(set.keys != NULL);
+
+    size_t n_tensors = 0;
+    for (int i = 0; i < graph->n_leafs; i++) {
+        n_tensors += ggml_gallocr_count_tensor(&set, graph->leafs[i]);
+    }
+    for (int i = 0; i < graph->n_nodes; i++) {
+        struct ggml_tensor * node = graph->nodes[i];
+        n_tensors += ggml_gallocr_count_tensor(&set, node);
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            n_tensors += ggml_gallocr_count_tensor(&set, node->src[j]);
+        }
+    }
+
+    ggml_hash_set_free(&set);
+    return n_tensors;
+}
+
 static bool ggml_gallocr_reserve_n_impl(
         ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, bool no_alloc) {
-    size_t min_hash_size = graph->n_nodes + graph->n_leafs;
+    size_t min_hash_size = ggml_gallocr_count_tensors(graph);
     // add 25% margin to avoid hash collisions
     min_hash_size += min_hash_size / 4;
 
