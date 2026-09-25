@@ -12660,9 +12660,15 @@ static int ggml_backend_vk_host_buffer_type_device(ggml_backend_buffer_type_t bu
 }
 
 static const char * ggml_backend_vk_host_buffer_type_name(ggml_backend_buffer_type_t buft) {
-    return GGML_VK_NAME "_Host";
+    static std::vector<std::string> names = [] {
+        std::vector<std::string> names(ggml_backend_vk_get_device_count());
+        for (int i = 0; i < (int) names.size(); i++) {
+            names[i] = i == 0 ? GGML_VK_NAME "_Host" : GGML_VK_NAME + std::to_string(i) + "_Host";
+        }
+        return names;
+    }();
 
-    UNUSED(buft);
+    return names[ggml_backend_vk_host_buffer_type_device(buft)].c_str();
 }
 
 static void ggml_backend_vk_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
