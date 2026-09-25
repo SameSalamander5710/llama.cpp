@@ -667,6 +667,18 @@ static void test_graph_optimize_alloc_dep() {
     GGML_ASSERT(!graph_reuses_allocation(true));
 }
 
+static void set_env(const char * name, const char * value) {
+#ifdef _WIN32
+    _putenv_s(name, value ? value : ""); // an empty value removes the variable
+#else
+    if (value) {
+        setenv(name, value, 1);
+    } else {
+        unsetenv(name);
+    }
+#endif
+}
+
 // Host-resident weights read by two device splits must be staged into two
 // non-overlapping slots of the device prefetch buffer. The device backend has a
 // non-host buffer type, the host backend owns the weights in a buffer pinned by
@@ -753,15 +765,11 @@ static void test_prefetch_staging_slots() {
 // Chained weight-offloading nodes on the same device backend with no
 // intervening host-backend node — the shape that real FFN blocks produce
 // under full GPU offload (the activation between ffn_up and ffn_down runs
-// on the device too). Without bounded fusion, all host weights collapse
-// into a single split; with the fix, splits are formed at every
-// max_lookahead boundary.
+// on the device too). Fusion is bounded by the staging slot in bytes, not by
+// node count, so a chain of weights that fits in one slot becomes a single
+// split and all of its DMAs hide under the previous split's compute.
 static void test_prefetch_bounded_fusion() {
-    const int n_weights      = 20;
-    // max_lookahead=1: one streamed weight per split, so each DMA can overlap
-    // the previous split's compute via the compute-fence in set_tensor_async.
-    const int max_lookahead  = 1;
-    const int expected_splits = (n_weights + max_lookahead - 1) / max_lookahead; // ceil(20/1) = 20
+    const int n_weights = 20; // 20 x 64 B, far below the default slot limit
 
     dummy_backend backend_device = dummy_backend_init(SIZE_MAX);
     dummy_backend backend_host   = dummy_backend_init(SIZE_MAX);
@@ -822,16 +830,97 @@ static void test_prefetch_bounded_fusion() {
     ggml_backend_sched_set_prefetch(sched.get(), true);
     GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
 
-    // Without the bounded-fusion fix, all n_weights weight-offloading nodes
-    // collapse into a single split (n_splits == 1). With the fix, splits are
-    // formed at every max_lookahead boundary.
+    // the whole chain fits in one staging slot, so it fuses into a single split
     const int n_splits = ggml_backend_sched_get_n_splits(sched.get());
-    GGML_ASSERT(n_splits == expected_splits);
+    GGML_ASSERT(n_splits == 1);
 
     // every weight must be staged into the device prefetch buffer
+    std::vector<const uint8_t *> staged(n_weights);
+    const size_t n = ggml_nbytes(muls[0]->src[0]);
     for (int i = 0; i < n_weights; i++) {
         GGML_ASSERT(muls[i]->src[0] != weights[i]);
         GGML_ASSERT(ggml_backend_buffer_get_type(muls[i]->src[0]->buffer) == &backend_device.buffer_type);
+        staged[i] = (const uint8_t *) muls[i]->src[0]->data;
+    }
+
+    // one split means one slot, so the staged copies must not alias each other
+    for (int i = 0; i < n_weights; i++) {
+        for (int j = i + 1; j < n_weights; j++) {
+            GGML_ASSERT(staged[i] + n <= staged[j] || staged[j] + n <= staged[i]);
+        }
+    }
+}
+
+// The staging slot is the only bound left on fusion: a weight that does not fit in
+// what the split has staged so far must start a new split instead of overflowing
+// the slot. 384 KiB weights give 2 per 1 MiB slot, so 8 weights must split in four.
+static void test_prefetch_byte_budget_split() {
+    const int n_weights   = 8;
+    const int n_per_split = 2;
+
+    dummy_backend backend_device = dummy_backend_init(SIZE_MAX);
+    dummy_backend backend_host   = dummy_backend_init(SIZE_MAX);
+    backend_device.context->is_host = false;
+    backend_device.context->type    = GGML_BACKEND_DEVICE_TYPE_GPU;
+
+    // pin the weight buffer type to backend_device, as in test_prefetch_bounded_fusion
+    ggml_backend_buffer_type pinned_buft = backend_host.buffer_type;
+    pinned_buft.device = &backend_device.context->device;
+
+    auto [ctx_w, _w, ctx_w_ptr] = make_context();
+    auto [ctx_x, _x, ctx_x_ptr] = make_context();
+    auto [ctx,   graph, ctx_ptr] = make_context();
+
+    // F32 [4, 4, 6144] is 384 KiB, an exact multiple of the 8 B alignment. ne0 and ne1
+    // stay 4 so the weights match the [4, 1, 6144] activation
+    std::vector<ggml_tensor *> weights(n_weights);
+    for (int i = 0; i < n_weights; i++) {
+        weights[i] = ggml_new_tensor_3d(ctx_w, GGML_TYPE_F32, 4, 4, 6144);
+        ggml_format_name(weights[i], "w%d", i);
+    }
+
+    ggml_tensor * x = ggml_new_tensor_3d(ctx_x, GGML_TYPE_F32, 4, 1, 6144);
+    ggml_set_input(x);
+    ggml_format_name(x, "x");
+
+    ggml_backend_buffer_ptr buf_x(ggml_backend_alloc_ctx_tensors_from_buft(ctx_x, &backend_device.buffer_type));
+    ggml_backend_buffer_ptr buf_w(ggml_backend_alloc_ctx_tensors_from_buft(ctx_w, &pinned_buft));
+    GGML_ASSERT(buf_x && buf_w);
+    ggml_backend_buffer_set_usage(buf_w.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    std::vector<ggml_tensor *> muls(n_weights);
+    for (int i = 0; i < n_weights; i++) {
+        muls[i] = ggml_mul_mat(ctx, weights[i], x);
+        ggml_format_name(muls[i], "m%d", i);
+        ggml_set_output(muls[i]);
+        ggml_build_forward_expand(graph, muls[i]);
+    }
+    GGML_ASSERT(graph->n_nodes == n_weights);
+
+    ggml_backend_t             backend_ptr[2] = { &backend_device.context->backend, &backend_host.context->backend };
+    ggml_backend_buffer_type_t bufts[2]       = { &backend_device.buffer_type, &backend_host.buffer_type };
+    set_env("GGML_SCHED_PREFETCH_MAX_SLOT_MB", "1");
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(backend_ptr, bufts, 2, 64, false, true));
+    set_env("GGML_SCHED_PREFETCH_MAX_SLOT_MB", nullptr);
+    ggml_backend_sched_set_prefetch(sched.get(), true);
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
+
+    // the byte budget, not the node count, is what breaks the row of nodes into pairs
+    GGML_ASSERT(ggml_backend_sched_get_n_splits(sched.get()) == n_weights / n_per_split);
+
+    // every weight still reaches the device through a staged copy
+    std::vector<const uint8_t *> staged(n_weights);
+    const size_t n = ggml_nbytes(muls[0]->src[0]);
+    for (int i = 0; i < n_weights; i++) {
+        GGML_ASSERT(muls[i]->src[0] != weights[i]);
+        GGML_ASSERT(ggml_backend_buffer_get_type(muls[i]->src[0]->buffer) == &backend_device.buffer_type);
+        staged[i] = (const uint8_t *) muls[i]->src[0]->data;
+    }
+
+    // the two copies of one split share a slot and must not overlap; the copies two
+    // splits apart land on the same address again, that is the two-slot reuse
+    for (int i = 0; i + 1 < n_weights; i++) {
+        GGML_ASSERT(staged[i] + n <= staged[i + 1] || staged[i + 1] + n <= staged[i]);
     }
 }
 
@@ -862,8 +951,8 @@ static void test_buffer_is_pinned() {
 }
 
 // MoE prefill with the expert tensors in host memory: three consecutive MUL_MAT_ID nodes (gate, up, down)
-// offloaded to the device, one split each. Experts pinned by the device are staged in full through the
-// prefetch slots when the batch routes to nearly every expert, everything else takes the stock copy path.
+// offloaded to the device. Experts pinned by the device are staged in full through the prefetch slots when
+// the batch routes to nearly every expert, everything else takes the stock copy path.
 struct moe_prefetch_graph {
     static constexpr int n_nodes  = 3;
     static constexpr int n_expert = 8;
@@ -951,22 +1040,25 @@ static void test_prefetch_moe_pinned_experts() {
     moe_prefetch_graph m(/*pinned=*/true, /*n_tokens=*/16); // 32 routes for 8 experts
     ggml_backend_sched_ptr sched = m.make_sched();
     GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), m.g.graph));
-    GGML_ASSERT(ggml_backend_sched_get_n_splits(sched.get()) == m.n_nodes);
+    // the three experts fit in one slot, so they fuse into a single split
+    GGML_ASSERT(ggml_backend_sched_get_n_splits(sched.get()) == 1);
 
     m.check_on_device();
     for (int i = 0; i < m.n_nodes; i++) {
         GGML_ASSERT(m.staged(i));
     }
 
-    // consecutive tensors alternate between two slots and never overlap; the third reuses the first slot
+    // all three land in the same slot at distinct offsets, so they must not overlap
     const uint8_t * p[m.n_nodes];
     for (int i = 0; i < m.n_nodes; i++) {
         p[i] = (const uint8_t *) m.mm[i]->src[0]->data;
     }
     const size_t n = ggml_nbytes(m.mm[0]->src[0]);
-    GGML_ASSERT(p[1] >= p[0] + n || p[0] >= p[1] + n);
-    GGML_ASSERT(p[2] >= p[1] + n || p[1] >= p[2] + n);
-    GGML_ASSERT(p[0] == p[2]);
+    for (int i = 0; i < m.n_nodes; i++) {
+        for (int j = i + 1; j < m.n_nodes; j++) {
+            GGML_ASSERT(p[i] + n <= p[j] || p[j] + n <= p[i]);
+        }
+    }
 }
 
 // experts in plain CPU memory are left to the selective copy of the stock path
@@ -991,18 +1083,6 @@ static void test_prefetch_moe_small_batch() {
     for (int i = 0; i < m.n_nodes; i++) {
         GGML_ASSERT(!m.staged(i));
     }
-}
-
-static void set_env(const char * name, const char * value) {
-#ifdef _WIN32
-    _putenv_s(name, value ? value : ""); // an empty value removes the variable
-#else
-    if (value) {
-        setenv(name, value, 1);
-    } else {
-        unsetenv(name);
-    }
-#endif
 }
 
 // staging that exceeds the slot limit must leave a valid graph: the weights fall back to the stock copies
@@ -1076,6 +1156,7 @@ int main() {
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
     run("test_prefetch_staging_slots", test_prefetch_staging_slots);
     run("test_prefetch_bounded_fusion", test_prefetch_bounded_fusion);
+    run("test_prefetch_byte_budget_split", test_prefetch_byte_budget_split);
     run("test_buffer_is_pinned", test_buffer_is_pinned);
     run("test_prefetch_moe_pinned_experts", test_prefetch_moe_pinned_experts);
     run("test_prefetch_moe_unpinned_experts", test_prefetch_moe_unpinned_experts);
