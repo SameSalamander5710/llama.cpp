@@ -13008,6 +13008,10 @@ ggml_backend_buffer_type_t ggml_backend_vk_buffer_type(size_t dev_num) {
     return &dev->buffer_type;
 }
 
+static int ggml_backend_vk_host_buffer_type_device(ggml_backend_buffer_type_t buft) {
+    return (int) static_cast<const ggml_backend_vk_device_context *>(buft->device->context)->device;
+}
+
 static const char * ggml_backend_vk_host_buffer_type_name(ggml_backend_buffer_type_t buft) {
     return GGML_VK_NAME "_Host";
 
@@ -13016,7 +13020,7 @@ static const char * ggml_backend_vk_host_buffer_type_name(ggml_backend_buffer_ty
 
 static void ggml_backend_vk_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     VK_LOG_MEMORY("ggml_backend_vk_host_buffer_free_buffer()");
-    ggml_vk_host_free(vk_instance.devices[0], buffer->context);
+    ggml_vk_host_free(vk_instance.devices[ggml_backend_vk_host_buffer_type_device(buffer->buft)], buffer->context);
 }
 
 static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
@@ -13025,7 +13029,7 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
     size += 32;  // Behave like the CPU buffer type
     void * ptr = nullptr;
     try {
-        ptr = ggml_vk_host_malloc(vk_instance.devices[0], size);
+        ptr = ggml_vk_host_malloc(vk_instance.devices[ggml_backend_vk_host_buffer_type_device(buft)], size);
     } catch (vk::SystemError& e) {
         GGML_LOG_WARN("ggml_vulkan: Failed to allocate pinned memory (%s)\n", e.what());
         // fallback to cpu buffer
@@ -13042,36 +13046,51 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
 }
 
 static size_t ggml_backend_vk_host_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
-    return vk_instance.devices[0]->properties.limits.minMemoryMapAlignment;
+    return vk_instance.devices[ggml_backend_vk_host_buffer_type_device(buft)]->properties.limits.minMemoryMapAlignment;
 
     UNUSED(buft);
 }
 
 static size_t ggml_backend_vk_host_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
-    return vk_instance.devices[0]->suballocation_block_size;
+    return vk_instance.devices[ggml_backend_vk_host_buffer_type_device(buft)]->suballocation_block_size;
 
     UNUSED(buft);
 }
 
+static ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type_for_device(int device) {
+    // the vector is never resized after this, so the returned pointers stay valid
+    static std::vector<ggml_backend_buffer_type> buffer_types_host = [] {
+        std::vector<ggml_backend_buffer_type> bufts(ggml_backend_vk_get_device_count());
+        for (size_t i = 0; i < bufts.size(); i++) {
+            bufts[i] = {
+                /* .iface    = */ {
+                    /* .get_name         = */ ggml_backend_vk_host_buffer_type_name,
+                    /* .alloc_buffer     = */ ggml_backend_vk_host_buffer_type_alloc_buffer,
+                    /* .get_alignment    = */ ggml_backend_vk_host_buffer_type_get_alignment,
+                    /* .get_max_size     = */ ggml_backend_vk_host_buffer_type_get_max_size,
+                    /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
+                    /* .is_host          = */ ggml_backend_cpu_buffer_type()->iface.is_host,
+                },
+                /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), i),
+                /* .context  = */ nullptr,
+            };
+        }
+        return bufts;
+    }();
+
+    GGML_ASSERT(device >= 0 && device < (int) buffer_types_host.size());
+
+    return &buffer_types_host[device];
+}
+
+// TODO: this function is unused and is a temporary hack to avoid breaking changes
 ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type() {
-    static struct ggml_backend_buffer_type ggml_backend_vk_buffer_type_host = {
-        /* .iface    = */ {
-            /* .get_name         = */ ggml_backend_vk_host_buffer_type_name,
-            /* .alloc_buffer     = */ ggml_backend_vk_host_buffer_type_alloc_buffer,
-            /* .get_alignment    = */ ggml_backend_vk_host_buffer_type_get_alignment,
-            /* .get_max_size     = */ ggml_backend_vk_host_buffer_type_get_max_size,
-            /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
-            /* .is_host          = */ ggml_backend_cpu_buffer_type()->iface.is_host,
-        },
-        /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), 0),
-        /* .context  = */ nullptr,
-    };
+    ggml_vk_instance_init();
 
     // Make sure device 0 is initialized
-    ggml_vk_instance_init();
     ggml_vk_get_device(0);
 
-    return &ggml_backend_vk_buffer_type_host;
+    return ggml_backend_vk_host_buffer_type_for_device(0);
 }
 
 static const char * ggml_backend_vk_name(ggml_backend_t backend) {
@@ -13100,7 +13119,7 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
                                                 size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     VK_LOG_DEBUG("ggml_backend_vk_set_tensor_2d_async(" << size << ", " << n_copies << ")");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
-    GGML_ASSERT((tensor->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || tensor->buffer->buft == ggml_backend_vk_host_buffer_type()) && "unsupported buffer type");
+    GGML_ASSERT((tensor->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || tensor->buffer->buft == ggml_backend_vk_host_buffer_type_for_device((int) ctx->device->idx)) && "unsupported buffer type");
 
     if (size == 0) {
         return;
@@ -13163,7 +13182,7 @@ static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const gg
                                                 size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     VK_LOG_DEBUG("ggml_backend_vk_get_tensor_2d_async(" << size << ", " << n_copies << ")");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
-    GGML_ASSERT((tensor->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || tensor->buffer->buft == ggml_backend_vk_host_buffer_type()) && "unsupported buffer type");
+    GGML_ASSERT((tensor->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || tensor->buffer->buft == ggml_backend_vk_host_buffer_type_for_device((int) ctx->device->idx)) && "unsupported buffer type");
 
     if (size == 0) {
         return;
@@ -15187,8 +15206,9 @@ static ggml_backend_buffer_type_t ggml_backend_vk_device_get_buffer_type(ggml_ba
 }
 
 static ggml_backend_buffer_type_t ggml_backend_vk_device_get_host_buffer_type(ggml_backend_dev_t dev) {
-    UNUSED(dev);
-    return ggml_backend_vk_host_buffer_type();
+    ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *) dev->context;
+
+    return ggml_backend_vk_host_buffer_type_for_device((int) ctx->device);
 }
 
 static enum ggml_backend_dev_type ggml_backend_vk_device_get_type(ggml_backend_dev_t dev) {
