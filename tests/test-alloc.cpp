@@ -669,7 +669,9 @@ static void test_graph_optimize_alloc_dep() {
 
 // Host-resident weights read by two device splits must be staged into two
 // non-overlapping slots of the device prefetch buffer. The device backend has a
-// non-host buffer type, the host backend owns the weights. MUL_MAT ops are
+// non-host buffer type, the host backend owns the weights in a buffer pinned by
+// the device (see test_buffer_is_pinned) — the generic candidate does not stage
+// weights the consuming device cannot DMA without a bounce. MUL_MAT ops are
 // offloaded to the device backend, so the weights must be staged across the
 // backends; the host-resident intermediate between the two muls forces the
 // graph into a device/host/device split sequence.
@@ -677,19 +679,26 @@ static void test_prefetch_staging_slots() {
     dummy_backend backend_device = dummy_backend_init(SIZE_MAX);
     dummy_backend backend_host   = dummy_backend_init(SIZE_MAX);
     backend_device.context->is_host = false;
+    backend_device.context->type    = GGML_BACKEND_DEVICE_TYPE_GPU;
+
+    // the generic candidate only stages weights pinned by the consuming device (see
+    // test_buffer_is_pinned); claim the host buffer type for backend_device the same way
+    // ggml_backend_vk_host_buffer_type_for_device pins Vulkan_Host to its owning device
+    ggml_backend_buffer_type pinned_buft = backend_host.buffer_type;
+    pinned_buft.device = &backend_device.context->device;
 
     auto [ctx_x, _x, ctx_x_ptr] = make_context();
     auto [ctx_w, _w, ctx_w_ptr] = make_context();
     auto [ctx_h, _h, ctx_h_ptr] = make_context();
     auto [ctx, graph, ctx_ptr]  = make_context();
 
-    // weights are plain tensors (no INPUT flag on purpose) in a host buffer
+    // weights are plain tensors (no INPUT flag on purpose) in a buffer pinned by backend_device
     ggml_tensor * w0 = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, 4, 4);
     ggml_tensor * w1 = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, 4, 4);
     ggml_format_name(w0, "w0");
     ggml_format_name(w1, "w1");
 
-    // activation on the device buffer, plain host intermediate
+    // activation on the device buffer, plain (unpinned) host intermediate
     ggml_tensor * x0 = ggml_new_tensor_2d(ctx_x, GGML_TYPE_F32, 4, 1);
     ggml_tensor * h1 = ggml_new_tensor_2d(ctx_h, GGML_TYPE_F32, 4, 1);
     ggml_set_input(x0);
@@ -698,7 +707,7 @@ static void test_prefetch_staging_slots() {
     ggml_format_name(h1, "h1");
 
     ggml_backend_buffer_ptr buf_x(ggml_backend_alloc_ctx_tensors_from_buft(ctx_x, &backend_device.buffer_type));
-    ggml_backend_buffer_ptr buf_w(ggml_backend_alloc_ctx_tensors_from_buft(ctx_w, &backend_host.buffer_type));
+    ggml_backend_buffer_ptr buf_w(ggml_backend_alloc_ctx_tensors_from_buft(ctx_w, &pinned_buft));
     ggml_backend_buffer_ptr buf_h(ggml_backend_alloc_ctx_tensors_from_buft(ctx_h, &backend_host.buffer_type));
     GGML_ASSERT(buf_x && buf_w && buf_h);
     ggml_backend_buffer_set_usage(buf_w.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
@@ -757,12 +766,18 @@ static void test_prefetch_bounded_fusion() {
     dummy_backend backend_device = dummy_backend_init(SIZE_MAX);
     dummy_backend backend_host   = dummy_backend_init(SIZE_MAX);
     backend_device.context->is_host = false;
+    backend_device.context->type    = GGML_BACKEND_DEVICE_TYPE_GPU;
+
+    // pin the weight buffer type to backend_device; the generic candidate requires it
+    // (see test_buffer_is_pinned / test_prefetch_staging_slots)
+    ggml_backend_buffer_type pinned_buft = backend_host.buffer_type;
+    pinned_buft.device = &backend_device.context->device;
 
     auto [ctx_w, _w, ctx_w_ptr] = make_context();
     auto [ctx_x, _x, ctx_x_ptr] = make_context();
     auto [ctx,   graph, ctx_ptr] = make_context();
 
-    // weights are plain tensors (no INPUT flag) in a host buffer
+    // weights are plain tensors (no INPUT flag) in a buffer pinned by backend_device
     std::vector<ggml_tensor *> weights(n_weights);
     for (int i = 0; i < n_weights; i++) {
         weights[i] = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, 4, 4);
@@ -775,7 +790,7 @@ static void test_prefetch_bounded_fusion() {
     ggml_format_name(x, "x");
 
     ggml_backend_buffer_ptr buf_x(ggml_backend_alloc_ctx_tensors_from_buft(ctx_x, &backend_device.buffer_type));
-    ggml_backend_buffer_ptr buf_w(ggml_backend_alloc_ctx_tensors_from_buft(ctx_w, &backend_host.buffer_type));
+    ggml_backend_buffer_ptr buf_w(ggml_backend_alloc_ctx_tensors_from_buft(ctx_w, &pinned_buft));
     GGML_ASSERT(buf_x && buf_w);
     ggml_backend_buffer_set_usage(buf_w.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
