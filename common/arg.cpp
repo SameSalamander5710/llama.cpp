@@ -1682,6 +1682,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_UBATCH"));
     add_opt(common_arg(
+        {"-pw", "--prefetch-weights"},
+        "prefetch host-resident weights into device memory during prefill (dense models only, disabled by default)",
+        [](common_params & params) {
+            params.prefetch_weights = true;
+        }
+    ));
+    add_opt(common_arg(
         {"--keep"}, "N",
         string_format("number of tokens to keep from the initial prompt (default: %d, -1 = all)", params.n_keep),
         [](common_params & params, int value) {
