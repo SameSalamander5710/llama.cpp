@@ -62,6 +62,7 @@ extern "C" {
     GGML_API size_t                         ggml_backend_buffer_get_alloc_size(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor);
     GGML_API void                           ggml_backend_buffer_clear         (ggml_backend_buffer_t buffer, uint8_t value);
     GGML_API bool                           ggml_backend_buffer_is_host       (ggml_backend_buffer_t buffer);
+    GGML_API bool                           ggml_backend_buffer_is_pinned     (ggml_backend_buffer_t buffer, ggml_backend_dev_t dev);
     GGML_API void                           ggml_backend_buffer_set_usage     (ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage);
     GGML_API enum ggml_backend_buffer_usage ggml_backend_buffer_get_usage     (ggml_backend_buffer_t buffer);
     GGML_API ggml_backend_buffer_type_t     ggml_backend_buffer_get_type      (ggml_backend_buffer_t buffer);
@@ -352,6 +353,11 @@ extern "C" {
 
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
+
+    // Enable or disable staging of host-resident weights into device memory during graph compute.
+    // Call it before the graph is split so the staging buffers get their size. Default: off.
+    GGML_API void                 ggml_backend_sched_set_prefetch(ggml_backend_sched_t sched, bool prefetch);
+    GGML_API bool                 ggml_backend_sched_get_prefetch(ggml_backend_sched_t sched);
 
     //
     // Meta backend
