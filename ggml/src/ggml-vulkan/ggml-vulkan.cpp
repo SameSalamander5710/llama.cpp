@@ -13096,20 +13096,14 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
     buffer->iface.free_buffer = ggml_backend_vk_host_buffer_free_buffer;
 
     return buffer;
-
-    UNUSED(buft);
 }
 
 static size_t ggml_backend_vk_host_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
     return vk_instance.devices[ggml_backend_vk_host_buffer_type_device(buft)]->properties.limits.minMemoryMapAlignment;
-
-    UNUSED(buft);
 }
 
 static size_t ggml_backend_vk_host_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
     return vk_instance.devices[ggml_backend_vk_host_buffer_type_device(buft)]->suballocation_block_size;
-
-    UNUSED(buft);
 }
 
 static ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type_for_device(int device) {
@@ -13135,16 +13129,14 @@ static ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type_for_device(in
 
     GGML_ASSERT(device >= 0 && device < (int) buffer_types_host.size());
 
+    // the interface reads vk_instance.devices[device], so the device must exist
+    ggml_vk_get_device(device);
+
     return &buffer_types_host[device];
 }
 
 // TODO: no callers in this tree, kept so the public API does not break
 ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type() {
-    ggml_vk_instance_init();
-
-    // Make sure device 0 is initialized
-    ggml_vk_get_device(0);
-
     return ggml_backend_vk_host_buffer_type_for_device(0);
 }
 
