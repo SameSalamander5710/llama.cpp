@@ -4103,6 +4103,12 @@ vk_device ggml_vk_get_device(size_t idx) {
                 device->memory_priority = true;
             } else if (strcmp("VK_EXT_external_memory_host", properties.extensionName) == 0) {
                 device->external_memory_host = true;
+            } else if (strcmp("VK_KHR_external_memory_fd", properties.extensionName) == 0) {
+                device->external_memory_fd = true;
+            } else if (strcmp("VK_KHR_external_memory_win32", properties.extensionName) == 0) {
+                device->external_memory_win32 = true;
+            } else if (strcmp(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME, properties.extensionName) == 0) {
+                device->external_memory_dma_buf = true;
 #if defined(VK_EXT_shader_64bit_indexing)
             } else if (strcmp("VK_EXT_shader_64bit_indexing", properties.extensionName) == 0) {
                 device->shader_64b_indexing = true;
@@ -4126,6 +4132,13 @@ vk_device ggml_vk_get_device(size_t idx) {
         vk::PhysicalDeviceSubgroupSizeControlPropertiesEXT subgroup_size_control_props;
         vk::PhysicalDeviceShaderIntegerDotProductPropertiesKHR shader_integer_dot_product_props;
         vk::PhysicalDeviceExternalMemoryHostPropertiesEXT external_memory_host_props;
+
+        // sharing memory between devices only matters when more than one is in use
+        if (vk_instance.device_indices.size() < 2) {
+            device->external_memory_fd = false;
+            device->external_memory_win32 = false;
+            device->external_memory_dma_buf = false;
+        }
 
         props2.pNext = &props3;
         props3.pNext = &subgroup_props;
@@ -4455,6 +4468,16 @@ vk_device ggml_vk_get_device(size_t idx) {
             device_extensions.push_back("VK_EXT_external_memory_host");
         }
 
+        if (device->external_memory_fd) {
+            device_extensions.push_back("VK_KHR_external_memory_fd");
+            if (device->external_memory_dma_buf) {
+                device_extensions.push_back("VK_EXT_external_memory_dma_buf");
+            }
+        }
+        if (device->external_memory_win32) {
+            device_extensions.push_back("VK_KHR_external_memory_win32");
+        }
+
 #if defined(VK_EXT_shader_64bit_indexing)
         VkPhysicalDeviceShader64BitIndexingFeaturesEXT shader_64bit_indexing_features {};
         shader_64bit_indexing_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_64_BIT_INDEXING_FEATURES_EXT;
@@ -4768,6 +4791,18 @@ vk_device ggml_vk_get_device(size_t idx) {
             .setPEnabledExtensionNames(device_extensions);
         device_create_info.setPNext(&device_features2);
         device->device = device->physical_device.createDevice(device_create_info);
+
+        if (device->external_memory_fd || device->external_memory_win32) {
+            device->id_props = device->physical_device.getProperties2<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceIDProperties>().get<vk::PhysicalDeviceIDProperties>();
+
+            std::vector<vk::PhysicalDevice> peers;
+            for (size_t peer_num : vk_instance.device_indices) {
+                if (peer_num != dev_num && peer_num < physical_devices.size()) {
+                    peers.push_back(physical_devices[peer_num]);
+                }
+            }
+            ggml_vk_init_direct_copy(device, peers);
+        }
 
         if (device->device_fault) {
             device->pfn_vkGetDeviceFaultInfoEXT = (PFN_vkGetDeviceFaultInfoEXT)
@@ -13027,7 +13062,8 @@ ggml_backend_buffer_t ggml_backend_vk_buffer_type_alloc_buffer(ggml_backend_buff
 
     vk_buffer dev_buffer = nullptr;
     try {
-        dev_buffer = ggml_vk_create_buffer_device(ctx->device, size);
+        // exportable, so that the other devices can copy out of it directly
+        dev_buffer = ggml_vk_create_buffer_device(ctx->device, size, true);
     } catch (const vk::SystemError& e) {
         return nullptr;
     }
@@ -13306,9 +13342,31 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
     if (ggml_backend_buffer_is_vk(src->buffer)) {
         ggml_backend_vk_buffer_context * src_buf_ctx = (ggml_backend_vk_buffer_context *)src->buffer->context;
 
-        // Async copy only works within the same device
+        // A buffer of another device is copied out of its own memory, without going through the host.
         if (src_buf_ctx->dev_buffer->device != dst_buf->device) {
-            return false;
+            // Only when the pair of devices has been verified to share memory. The first copy between them is a
+            // blocking one that checks it, so this falls back to that.
+            if (!ggml_vk_buffer_copy_direct_ready(src_buf_ctx->dev_buffer, dst_buf->device)) {
+                return false;
+            }
+
+            // The scheduler does not wait for the source backend when the copy is asynchronous, so the data the
+            // source has produced must be complete before the copy is submitted. Weights never change once they
+            // are loaded and need no wait, which keeps the source device out of the way of a prefetch.
+            if (backend_src != nullptr && ggml_backend_buffer_get_usage(src->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                ggml_backend_synchronize(backend_src);
+            }
+
+            vk_context cpy_ctx;
+            if (ctx->device->async_use_transfer_queue) {
+                cpy_ctx = ggml_vk_get_transfer_ctx(ctx);
+            } else {
+                cpy_ctx = ggml_vk_get_compute_ctx(ctx);
+            }
+
+            return ggml_vk_buffer_copy_direct_async(cpy_ctx, dst_buf, vk_tensor_offset(dst) + dst->view_offs,
+                                                    src_buf_ctx->dev_buffer, vk_tensor_offset(src) + src->view_offs,
+                                                    ggml_nbytes(src));
         }
 
         vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
@@ -16200,6 +16258,12 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     }
     if (strcmp(name, "ggml_backend_peer_copy_synchronize") == 0) {
         return (void *) ggml_backend_vk_peer_copy_synchronize;
+    }
+    // void ggml_backend_vk_get_copy_stats(size_t * direct_bytes, size_t * shared_bytes, size_t * host_bytes)
+    // bytes copied between devices straight out of the memory of the other device, through memory shared by both
+    // devices without a copy on the CPU, and through host staging buffers
+    if (strcmp(name, "ggml_backend_vk_get_copy_stats") == 0) {
+        return (void *) ggml_vk_copy_stats;
     }
     return NULL;
 }
