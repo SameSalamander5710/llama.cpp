@@ -735,6 +735,59 @@ static void test_prefetch_staging_slots() {
     GGML_ASSERT(b0 >= a0 + an || a0 >= b0 + bn);
 }
 
+// a weight in the memory of another device must be streamed into the device that owns the layer. The activation sits on backend_dev, so the mul_mat runs there and reads a staged copy of the weight. Without the prefetch toggle the op stays on the device that holds the weight.
+static void test_prefetch_remote_device_weight() {
+    dummy_backend backend_src = dummy_backend_init(SIZE_MAX); // holds the weight
+    dummy_backend backend_dev = dummy_backend_init(SIZE_MAX); // owns the layer
+    dummy_backend backend_cpu = dummy_backend_init(SIZE_MAX);
+    for (dummy_backend * b : { &backend_src, &backend_dev }) {
+        b->context->is_host = false;
+        b->context->type    = GGML_BACKEND_DEVICE_TYPE_GPU;
+    }
+
+    auto run = [](dummy_backend & backend_src, dummy_backend & backend_dev, dummy_backend & backend_cpu, bool prefetch) {
+        auto [ctx_x, _x, ctx_x_ptr] = make_context();
+        auto [ctx_w, _w, ctx_w_ptr] = make_context();
+        auto [ctx, graph, ctx_ptr]  = make_context();
+
+        ggml_tensor * w = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, 4, 4);
+        ggml_format_name(w, "w");
+        ggml_tensor * x = ggml_new_tensor_2d(ctx_x, GGML_TYPE_F32, 4, 8);
+        ggml_set_input(x);
+        ggml_format_name(x, "x");
+
+        ggml_backend_buffer_ptr buf_x(ggml_backend_alloc_ctx_tensors_from_buft(ctx_x, &backend_dev.buffer_type));
+        ggml_backend_buffer_ptr buf_w(ggml_backend_alloc_ctx_tensors_from_buft(ctx_w, &backend_src.buffer_type));
+        GGML_ASSERT(buf_x && buf_w);
+        ggml_backend_buffer_set_usage(buf_w.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+        ggml_tensor * m = ggml_mul_mat(ctx, w, x);
+        ggml_format_name(m, "m");
+        ggml_set_output(m);
+        ggml_build_forward_expand(graph, m);
+        GGML_ASSERT(graph->n_nodes == 1);
+        GGML_ASSERT(graph->n_leafs == 2);
+
+        ggml_backend_t             backends[3] = { &backend_src.context->backend, &backend_dev.context->backend, &backend_cpu.context->backend };
+        ggml_backend_buffer_type_t bufts[3]    = { &backend_src.buffer_type, &backend_dev.buffer_type, &backend_cpu.buffer_type };
+        ggml_backend_sched_ptr     sched(ggml_backend_sched_new(backends, bufts, 3, 8, false, true));
+        ggml_backend_sched_set_prefetch(sched.get(), prefetch);
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
+
+        if (!prefetch) {
+            GGML_ASSERT(ggml_backend_sched_get_tensor_backend(sched.get(), m) == &backend_src.context->backend);
+            return;
+        }
+        GGML_ASSERT(ggml_backend_sched_get_tensor_backend(sched.get(), m) == &backend_dev.context->backend);
+        GGML_ASSERT(m->src[0] != w);
+        GGML_ASSERT(strstr(m->src[0]->name, "#pf") != nullptr);
+        GGML_ASSERT(ggml_backend_buffer_get_type(m->src[0]->buffer) == &backend_dev.buffer_type);
+    };
+
+    run(backend_src, backend_dev, backend_cpu, false);
+    run(backend_src, backend_dev, backend_cpu, true);
+}
+
 static void run(const char * name, void (*f)()) {
     printf("%s ", name);
     fflush(stdout);
@@ -758,5 +811,6 @@ int main() {
     run("test_reallocation", test_reallocation);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
     run("test_prefetch_staging_slots", test_prefetch_staging_slots);
+    run("test_prefetch_remote_device_weight", test_prefetch_remote_device_weight);
     return 0;
 }
