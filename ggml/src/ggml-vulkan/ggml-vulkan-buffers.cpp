@@ -698,13 +698,18 @@ void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& src, size
         ggml_vk_queue_command_pools_cleanup(src->device);
     } else {
         VK_LOG_DEBUG("ggml_vk_buffer_copy(MULTI_DEVICE, " << size << ")");
-        // Copy device to device
-        ggml_vk_ensure_sync_staging_buffer(src->device, size);
+        // Copy device to device through host staging, in chunks so the staging buffer of both devices stays small no matter how large the tensor is
+        constexpr size_t chunk_size = 32*1024*1024;
 
-        // Copy to src staging buffer
-        ggml_vk_buffer_copy(src->device->sync_staging, 0, src, src_offset, size);
-        // Copy to dst buffer
-        ggml_vk_buffer_write(dst, dst_offset, src->device->sync_staging->ptr, size);
+        for (size_t off = 0; off < size; off += chunk_size) {
+            const size_t chunk = std::min(chunk_size, size - off);
+            ggml_vk_ensure_sync_staging_buffer(src->device, chunk);
+
+            // Copy to src staging buffer
+            ggml_vk_buffer_copy(src->device->sync_staging, 0, src, src_offset + off, chunk);
+            // Copy to dst buffer
+            ggml_vk_buffer_write(dst, dst_offset + off, src->device->sync_staging->ptr, chunk);
+        }
     }
 }
 
