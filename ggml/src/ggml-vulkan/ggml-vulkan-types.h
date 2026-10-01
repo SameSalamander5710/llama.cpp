@@ -2,7 +2,18 @@
 
 #include "ggml-vulkan.h"
 
-#include <vulkan/vulkan_core.h>
+#if defined(_WIN32)
+// the native handles of Vulkan memory on Windows are declared by the win32 platform header
+#  ifndef NOMINMAX
+#    define NOMINMAX 1
+#  endif
+#  ifndef VK_USE_PLATFORM_WIN32_KHR
+#    define VK_USE_PLATFORM_WIN32_KHR 1
+#  endif
+#  include <vulkan/vulkan.h>
+#else
+#  include <vulkan/vulkan_core.h>
+#endif
 
 #if defined(GGML_VULKAN_RUN_TESTS) || defined(GGML_VULKAN_CHECK_RESULTS)
 #include <chrono>
@@ -310,6 +321,7 @@ typedef std::shared_ptr<vk_device_struct> vk_device;
 typedef std::weak_ptr<vk_device_struct> vk_device_ref;
 
 struct vk_buffer_struct;
+struct vk_peer_pair;
 
 typedef std::shared_ptr<vk_buffer_struct> vk_buffer;
 
@@ -699,6 +711,18 @@ struct vk_device_struct {
     uint64_t suballocation_block_size;
     uint64_t min_imported_host_pointer_alignment;
     bool external_memory_host {};
+    // Direct device to device copies. Device buffers are allocated exportable and the other device imports
+    // them, then pulls from them with a plain copy command, so the data never goes through host memory.
+    // The native handle is a file descriptor on Linux and an NT handle on Windows.
+    bool external_memory_fd {};
+    bool external_memory_win32 {};
+    bool external_memory_dma_buf {};
+    vk::ExternalMemoryHandleTypeFlagBits export_handle_type {}; // none when device buffers are not exported
+    bool export_dedicated {};
+    vk::PhysicalDeviceIDProperties id_props;
+    // what copies from another device into this one use, per source device, see ggml-vulkan-peer-copy.cpp
+    std::mutex peer_mutex;
+    std::map<const void *, std::shared_ptr<vk_peer_pair>> peer_pairs;
     bool fp16;
     bool bf16;
     bool pipeline_robustness;
@@ -1064,6 +1088,14 @@ struct vk_buffer_struct {
     vk::DeviceAddress bda_addr {};
 
     vk_device device;
+
+    // set when the memory was allocated so that another device can import it
+    vk::ExternalMemoryHandleTypeFlagBits export_handle_type {};
+    vk::DeviceSize alloc_size = 0;
+    uint32_t memory_type_index = 0;
+    // views of this buffer imported by other devices, kept so a copy does not import it again
+    std::mutex imports_mutex;
+    std::vector<std::shared_ptr<vk_buffer_struct>> imports;
 
     ~vk_buffer_struct() {
         if (size == 0) {

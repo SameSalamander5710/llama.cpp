@@ -350,6 +350,9 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     llama_build_and_test(test-vulkan-peer-copy.cpp)
 endif()
 
+# copies between two devices of a backend, skips itself when there are fewer than two
+llama_build_and_test(test-dev2dev-copy.cpp)
+
 llama_build(test-export-graph-ops.cpp)
 if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)

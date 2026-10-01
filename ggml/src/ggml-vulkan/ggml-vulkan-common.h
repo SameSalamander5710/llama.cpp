@@ -39,7 +39,7 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
 
 // buffers
 vk_buffer ggml_vk_create_buffer_check(vk_device& device, size_t size, vk::MemoryPropertyFlags req_flags, vk::MemoryPropertyFlags fallback_flags = vk::MemoryPropertyFlags(0));
-vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size);
+vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size, bool exportable = false);
 void ggml_vk_destroy_buffer(vk_buffer& buf);
 void * ggml_vk_host_malloc(vk_device& device, size_t size);
 void ggml_vk_host_free(vk_device& device, void* ptr);
@@ -55,6 +55,32 @@ void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, size_t sp
 void ggml_vk_buffer_read(vk_buffer& src, size_t offset, void * dst, size_t size);
 void ggml_vk_buffer_copy_async(vk_context& ctx, vk_buffer& dst, size_t dst_offset, vk_buffer& src, size_t src_offset, size_t size);
 void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& src, size_t src_offset, size_t size);
+// direct device to device copies, see ggml-vulkan-buffers.cpp
+void ggml_vk_init_direct_copy(vk_device& device, const std::vector<vk::PhysicalDevice> & peers);
+int  ggml_vk_copy_mode();
+const char * ggml_vk_handle_type_name(vk::ExternalMemoryHandleTypeFlagBits type);
+bool ggml_vk_same_physical_device(const vk::PhysicalDeviceIDProperties & a, const vk::PhysicalDeviceIDProperties & b);
+bool ggml_vk_can_import_from(vk::PhysicalDevice pd, const vk::PhysicalDeviceIDProperties & pd_id, const vk_device & exporter,
+                             vk::ExternalMemoryHandleTypeFlagBits type, bool exporter_dedicated);
+// the view of an exportable buffer of another device that dst can copy from, imported on first use
+vk_buffer ggml_vk_buffer_get_import(vk_buffer& src, vk_device& dst);
+bool ggml_vk_buffer_copy_direct_ready(vk_buffer& src, vk_device& dst);
+bool ggml_vk_buffer_copy_direct_async(vk_context& ctx, vk_buffer& dst, size_t dst_offset, vk_buffer& src, size_t src_offset, size_t size);
+
+// copies between two devices that need no copy on the CPU, see ggml-vulkan-peer-copy.cpp. They use resources of
+// their own, so they can run while the devices compute, and from any thread.
+enum vk_peer_path {
+    VK_PEER_PATH_NONE,   // not possible for this pair of devices, the caller copies through host staging
+    VK_PEER_PATH_DIRECT, // the destination device read the memory of the source device
+    VK_PEER_PATH_SHARED, // through host memory that both devices import
+};
+vk_peer_path ggml_vk_peer_copy_try(vk_buffer & src, size_t src_offset, vk_buffer & dst, size_t dst_offset, size_t size);
+// whether src is known to be readable by dst, which makes a copy that is recorded into the commands of dst possible
+bool ggml_vk_peer_direct_ready(vk_buffer & src, vk_device & dst);
+// count bytes copied, for ggml_vk_copy_stats
+void ggml_vk_peer_count_host_bytes(size_t size);
+void ggml_vk_peer_count_direct_bytes(size_t size);
+void ggml_vk_copy_stats(size_t * direct_bytes, size_t * shared_bytes, size_t * host_bytes);
 void ggml_vk_buffer_memset_async(vk_context& ctx, vk_buffer& dst, size_t offset, uint32_t c, size_t size);
 void ggml_vk_buffer_memset(vk_buffer& dst, size_t offset, uint32_t c, size_t size);
 vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, size_t size);
