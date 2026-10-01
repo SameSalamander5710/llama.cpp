@@ -1683,7 +1683,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_UBATCH"));
     add_opt(common_arg(
         {"-pw", "--prefetch-weights"},
-        "prefetch host-resident weights into device memory during prefill (dense models only, disabled by default)",
+        "stage weights that are not resident on the compute device into device memory during prefill (prefill only, decode placement unchanged; dense models only, disabled by default)",
         [](common_params & params) {
             params.prefetch_weights = true;
         }

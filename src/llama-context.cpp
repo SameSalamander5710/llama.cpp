@@ -1430,7 +1430,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
-        // prefetch host-resident weights into device memory for real prefill-sized ubatches
+        // stage weights that are not resident on the compute device into device memory, for real prefill-sized ubatches
         ggml_backend_sched_set_prefetch(sched.get(), llama_context_should_prefetch(cparams, ubatch.n_tokens));
 
         //const auto t_start_us = ggml_time_us();
