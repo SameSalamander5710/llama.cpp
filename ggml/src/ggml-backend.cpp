@@ -1444,16 +1444,19 @@ static void ggml_backend_sched_prefetch_wait_staged(ggml_backend_sched_t sched, 
 
 // copies one weight into device memory. A weight in another device's memory holds no host bytes,
 // so it goes through the copy path of the backend instead of a host write. That copy is a host
-// round trip, so it blocks and both backends must be idle before it runs.
+// round trip that blocks, and the backends recycle their command pools while it runs, so both
+// backends must be idle before it starts.
 static void ggml_backend_sched_prefetch_copy(
         ggml_backend_sched_t sched, ggml_backend_t backend, struct ggml_tensor * src, struct ggml_tensor * dst) {
     ggml_backend_buffer_t buf = src->view_src ? src->view_src->buffer : src->buffer;
     if (buf != NULL && !ggml_backend_buffer_is_host(buf)) {
-        const int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, dst);
-        if (src_backend_id >= 0) {
-            ggml_backend_tensor_copy_async(sched->backends[src_backend_id], backend, src, dst);
-            return;
+        // the backend that owns the weight, looked up by buffer type only, since the staged copy is not an op and the backend may not claim it supports one
+        for (int i = 0; i < sched->n_backends; i++) {
+            if (sched->backends[i] != backend && ggml_backend_supports_buft(sched->backends[i], buf->buft)) {
+                ggml_backend_synchronize(sched->backends[i]);
+            }
         }
+        ggml_backend_synchronize(backend);
         ggml_backend_tensor_copy(src, dst);
         return;
     }
