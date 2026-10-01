@@ -245,6 +245,17 @@ extern "C" {
         void * context;
     };
 
+    // Optional backend extension: copy a tensor from the memory of another device without blocking
+    // A backend that can do it returns the two functions below from get_proc_address, under the names "ggml_backend_peer_copy_async" and "ggml_backend_peer_copy_synchronize".
+    // peer_copy_async starts copying src, a tensor in the memory of the device of backend_src, into dst, a tensor in the memory of the device of backend_dst, and returns before the copy is done.
+    // It returns false and does nothing if it cannot copy these two tensors, and the caller then falls back to ggml_backend_tensor_copy.
+    // The copy is not ordered with the work queued on either backend:
+    //   - src must not change until the copy is done
+    //   - dst must not be in use by backend_dst when the copy is started
+    // peer_copy_synchronize returns when the copies started so far into the device of backend_dst are done, and the work submitted to that backend after it returns sees the copied data.
+    typedef bool (*ggml_backend_peer_copy_async_t)(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst);
+    typedef void (*ggml_backend_peer_copy_synchronize_t)(ggml_backend_t backend_dst);
+
     // Add backend dynamic loading support to the backend
 
     // Initialize the backend
