@@ -1112,6 +1112,8 @@ static bool ggml_backend_sched_prefetch_remote(
            src_dev != ggml_backend_get_device(sched->backends[backend_id]);
 }
 
+static size_t ggml_backend_sched_prefetch_pack_limit(ggml_backend_sched_t sched, int backend_id);
+
 // true if a weight should be staged into device memory on backend_id instead of the stock copy path. The caller checked buffer support already.
 static bool ggml_backend_sched_prefetch_candidate(
         ggml_backend_sched_t sched, struct ggml_tensor * src, struct ggml_tensor * node, int backend_id) {
@@ -1137,6 +1139,11 @@ static bool ggml_backend_sched_prefetch_candidate(
     }
     // staging into a host buffer only adds a copy, so skip host buffer types
     if (sched->bufts[backend_id] == NULL || ggml_backend_buft_is_host(sched->bufts[backend_id])) {
+        return false;
+    }
+    // a weight that does not fit an empty staging slot cannot be staged, and splitting does not help since the weight is one tensor, so the stock copy path has to take it
+    const size_t size = ggml_backend_buft_get_alloc_size(sched->bufts[backend_id], src);
+    if (size > ggml_backend_sched_prefetch_pack_limit(sched, backend_id)) {
         return false;
     }
     if (ggml_backend_buffer_is_host(buf)) {
