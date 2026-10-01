@@ -102,10 +102,9 @@ static bool dummy_backend_device_supports_buft(ggml_backend_dev_t device, ggml_b
     return device->context == buft->context;
 }
 
-// same op set the accelerator backends offload, so MUL_MAT runs on the device backend
+// like the accelerator backends, which offload any op that works on a large batch (GET_ROWS excluded), so the ops around a mul_mat can be offloaded too, not only the mul_mat itself
 static bool dummy_backend_device_offload_op(ggml_backend_dev_t, const ggml_tensor * op) {
-    return op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID ||
-           op->op == GGML_OP_GET_ROWS || op->op == GGML_OP_OUT_PROD;
+    return op->op != GGML_OP_GET_ROWS;
 }
 
 // ggml_backend interface
@@ -788,6 +787,92 @@ static void test_prefetch_remote_device_weight() {
     run(backend_src, backend_dev, backend_cpu, true);
 }
 
+// an FFN whose weights sit in the memory of another device than the rest of the layer. The whole FFN block must run on the layer device, every weight of it staged there, with no hop back to the device that holds the weights.
+// remote_norm puts ffn_norm on the weight device too, as `-ot "ffn_.*=dev"` does, so the op in front of the FFN matmuls is itself an op with a remote weight.
+static void test_prefetch_ffn_block(bool remote_norm, int n_layers) {
+    dummy_backend backend_src = dummy_backend_init(SIZE_MAX); // holds the FFN weights
+    dummy_backend backend_dev = dummy_backend_init(SIZE_MAX); // owns the layer
+    dummy_backend backend_cpu = dummy_backend_init(SIZE_MAX);
+    for (dummy_backend * b : { &backend_src, &backend_dev }) {
+        b->context->is_host = false;
+        b->context->type    = GGML_BACKEND_DEVICE_TYPE_GPU;
+    }
+
+    auto [ctx_x, _x, ctx_x_ptr]   = make_context();
+    auto [ctx_l, _l, ctx_l_ptr]   = make_context(); // weights of the layer device
+    auto [ctx_f, _f, ctx_f_ptr]   = make_context(); // weights of the other device
+    auto [ctx, graph, ctx_ptr]    = make_context();
+
+    ggml_tensor * x = ggml_new_tensor_2d(ctx_x, GGML_TYPE_F32, 4, 8);
+    ggml_set_input(x);
+    ggml_format_name(x, "x");
+
+    struct layer { ggml_tensor * attn, * norm, * gate, * up, * down; };
+    std::vector<layer> layers;
+    for (int il = 0; il < n_layers; il++) {
+        layer l;
+        l.attn = ggml_new_tensor_2d(ctx_l, GGML_TYPE_F32, 4, 4);
+        l.norm = ggml_new_tensor_1d(remote_norm ? ctx_f : ctx_l, GGML_TYPE_F32, 4);
+        l.gate = ggml_new_tensor_2d(ctx_f, GGML_TYPE_F32, 4, 4);
+        l.up   = ggml_new_tensor_2d(ctx_f, GGML_TYPE_F32, 4, 4);
+        l.down = ggml_new_tensor_2d(ctx_f, GGML_TYPE_F32, 4, 4);
+        ggml_format_name(l.attn, "attn%d", il);
+        ggml_format_name(l.norm, "norm%d", il);
+        ggml_format_name(l.gate, "gate%d", il);
+        ggml_format_name(l.up,   "up%d",   il);
+        ggml_format_name(l.down, "down%d", il);
+        layers.push_back(l);
+    }
+
+    ggml_backend_buffer_ptr buf_x(ggml_backend_alloc_ctx_tensors_from_buft(ctx_x, &backend_dev.buffer_type));
+    ggml_backend_buffer_ptr buf_l(ggml_backend_alloc_ctx_tensors_from_buft(ctx_l, &backend_dev.buffer_type));
+    ggml_backend_buffer_ptr buf_f(ggml_backend_alloc_ctx_tensors_from_buft(ctx_f, &backend_src.buffer_type));
+    GGML_ASSERT(buf_x && buf_l && buf_f);
+    ggml_backend_buffer_set_usage(buf_l.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_backend_buffer_set_usage(buf_f.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    std::vector<ggml_tensor *> nodes;
+    std::vector<ggml_tensor *> staged; // the matmuls that read a remote weight
+    ggml_tensor * cur = x;
+    for (const layer & l : layers) {
+        ggml_tensor * a = ggml_mul_mat(ctx, l.attn, cur);
+        ggml_tensor * r = ggml_add(ctx, a, cur);
+        ggml_tensor * n = ggml_mul(ctx, ggml_rms_norm(ctx, r, 1e-5f), l.norm);
+        ggml_tensor * g = ggml_mul_mat(ctx, l.gate, n);
+        ggml_tensor * u = ggml_mul_mat(ctx, l.up, n);
+        ggml_tensor * h = ggml_mul(ctx, ggml_silu(ctx, g), u);
+        ggml_tensor * d = ggml_mul_mat(ctx, l.down, h);
+        cur = ggml_add(ctx, d, r);
+        for (ggml_tensor * t : { a, r, n, g, u, h, d, cur }) {
+            nodes.push_back(t);
+        }
+        for (ggml_tensor * t : { g, u, d }) {
+            staged.push_back(t);
+        }
+        if (remote_norm) {
+            staged.push_back(n);
+        }
+    }
+    ggml_set_output(cur);
+    ggml_build_forward_expand(graph, cur);
+
+    ggml_backend_t             backends[3] = { &backend_src.context->backend, &backend_dev.context->backend, &backend_cpu.context->backend };
+    ggml_backend_buffer_type_t bufts[3]    = { &backend_src.buffer_type, &backend_dev.buffer_type, &backend_cpu.buffer_type };
+    ggml_backend_sched_ptr     sched(ggml_backend_sched_new(backends, bufts, 3, 64*n_layers, false, true));
+    ggml_backend_sched_set_prefetch(sched.get(), true);
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
+
+    // the whole block stays on the layer device, in one split
+    for (ggml_tensor * t : nodes) {
+        GGML_ASSERT(ggml_backend_sched_get_tensor_backend(sched.get(), t) == &backend_dev.context->backend);
+    }
+    GGML_ASSERT(ggml_backend_sched_get_n_splits(sched.get()) == 1);
+    // and each remote weight is read from its staged copy
+    for (ggml_tensor * t : staged) {
+        GGML_ASSERT(strstr(t->src[0]->name, "#pf") != nullptr || strstr(t->src[1]->name, "#pf") != nullptr);
+    }
+}
+
 static void run(const char * name, void (*f)()) {
     printf("%s ", name);
     fflush(stdout);
@@ -812,5 +897,8 @@ int main() {
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
     run("test_prefetch_staging_slots", test_prefetch_staging_slots);
     run("test_prefetch_remote_device_weight", test_prefetch_remote_device_weight);
+    run("test_prefetch_ffn_block", []() { test_prefetch_ffn_block(false, 1); });
+    run("test_prefetch_ffn_block_remote_norm", []() { test_prefetch_ffn_block(true, 1); });
+    run("test_prefetch_ffn_block_2_layers", []() { test_prefetch_ffn_block(true, 2); });
     return 0;
 }
