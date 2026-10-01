@@ -1010,6 +1010,10 @@ struct ggml_backend_sched {
     int prefetch_slot_cursor[GGML_SCHED_MAX_BACKENDS];
     ggml_backend_event_t compute_events[GGML_SCHED_MAX_BACKENDS][2];
     bool   compute_events_armed[GGML_SCHED_MAX_BACKENDS][2];
+    // optional non-blocking copy of a weight from the memory of another device (see ggml-backend-impl.h), NULL for a backend that has none. Off with GGML_SCHED_PREFETCH_NO_PEER set
+    bool prefetch_peer;
+    ggml_backend_peer_copy_async_t       peer_copy_async[GGML_SCHED_MAX_BACKENDS];
+    ggml_backend_peer_copy_synchronize_t peer_copy_sync[GGML_SCHED_MAX_BACKENDS];
     // staged copies per (tensor, backend, slot), indexed like hv_tensor_copies
     struct ggml_tensor ** prefetch_staged;
     size_t * prefetch_staged_offsets;
@@ -1427,12 +1431,31 @@ static void ggml_backend_sched_prefetch_debug_check(ggml_backend_sched_t sched, 
     sched->debug_prefetch_range[backend_id][slot].size = size;
 }
 
+// true if the staged copies of a split stream in beside the compute of the backend that consumes them, that is some of its weights are in the memory of another device and the backend can copy them without blocking
+static bool ggml_backend_sched_prefetch_peer(ggml_backend_sched_t sched, const struct ggml_backend_sched_split * split) {
+    if (!sched->prefetch_peer || sched->peer_copy_async[split->backend_id] == NULL) {
+        return false;
+    }
+    for (int i = 0; i < split->n_prefetch; i++) {
+        const struct ggml_tensor * src = split->prefetch_srcs[i];
+        ggml_backend_buffer_t buf = src->view_src ? src->view_src->buffer : src->buffer;
+        if (buf != NULL && !ggml_backend_buffer_is_host(buf)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // waits for the staged copies of a split to be visible to the consuming backend
 static void ggml_backend_sched_prefetch_wait_staged(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split) {
     if (!sched->prefetch || split->n_prefetch == 0) {
         return;
     }
     ggml_backend_t backend = sched->backends[split->backend_id];
+    // the weights from another device are copied by the backend on its own beside the compute of the previous split, and they were started when that split was launched, so they are the only copies in flight
+    if (ggml_backend_sched_prefetch_peer(sched, split)) {
+        sched->peer_copy_sync[split->backend_id](backend);
+    }
     // the prefetch DMA for this split was issued before its compute, on the backend transfer
     // stream. A backend without async support must synchronize so the compute sees the data.
     struct ggml_backend_dev_props props;
@@ -1442,15 +1465,25 @@ static void ggml_backend_sched_prefetch_wait_staged(ggml_backend_sched_t sched, 
     }
 }
 
-// copies one weight into device memory. A weight in another device's memory holds no host bytes,
-// so it goes through the copy path of the backend instead of a host write. That copy is a host
-// round trip that blocks, and the backends recycle their command pools while it runs, so both
-// backends must be idle before it starts.
+// copies one weight into device memory. A weight in another device's memory holds no host bytes, so it is either copied by the backend beside its compute, if the backend can do that, or goes through the blocking copy path.
+// That one is a host round trip, and the backends recycle their command pools while it runs, so both backends must be idle before it starts.
 static void ggml_backend_sched_prefetch_copy(
-        ggml_backend_sched_t sched, ggml_backend_t backend, struct ggml_tensor * src, struct ggml_tensor * dst) {
+        ggml_backend_sched_t sched, int backend_id, struct ggml_tensor * src, struct ggml_tensor * dst) {
+    ggml_backend_t backend = sched->backends[backend_id];
     ggml_backend_buffer_t buf = src->view_src ? src->view_src->buffer : src->buffer;
     if (buf != NULL && !ggml_backend_buffer_is_host(buf)) {
         // the backend that owns the weight, looked up by buffer type only, since the staged copy is not an op and the backend may not claim it supports one
+        ggml_backend_t src_backend = NULL;
+        for (int i = 0; i < sched->n_backends; i++) {
+            if (sched->backends[i] != backend && ggml_backend_supports_buft(sched->backends[i], buf->buft)) {
+                src_backend = sched->backends[i];
+                break;
+            }
+        }
+        if (src_backend != NULL && sched->prefetch_peer && sched->peer_copy_async[backend_id] != NULL &&
+            sched->peer_copy_async[backend_id](src_backend, backend, src, dst)) {
+            return;
+        }
         for (int i = 0; i < sched->n_backends; i++) {
             if (sched->backends[i] != backend && ggml_backend_supports_buft(sched->backends[i], buf->buft)) {
                 ggml_backend_synchronize(sched->backends[i]);
@@ -1475,7 +1508,14 @@ static void ggml_backend_sched_prefetch_fire(ggml_backend_sched_t sched, int spl
     // do not overwrite a slot while a previous split's compute may still read it
     if (slot >= 0 && sched->compute_events_armed[split->backend_id][slot]) {
         ggml_backend_event_t ev = sched->compute_events[split->backend_id][slot];
-        if (ev != NULL) {
+        if (ggml_backend_sched_prefetch_peer(sched, split)) {
+            // a copy made by the backend beside its compute is not ordered behind the work queued on it, so wait for the compute on the host. Only the compute that reads this slot is waited for, the split that is running now reads the other one
+            if (ev != NULL) {
+                ggml_backend_event_synchronize(ev);
+            } else {
+                ggml_backend_synchronize(backend);
+            }
+        } else if (ev != NULL) {
             ggml_backend_event_wait(backend, ev);
         } else {
             ggml_backend_synchronize(backend);
@@ -1495,7 +1535,7 @@ static void ggml_backend_sched_prefetch_fire(ggml_backend_sched_t sched, int spl
         }
     }
     for (int i = 0; i < split->n_prefetch; i++) {
-        ggml_backend_sched_prefetch_copy(sched, backend, split->prefetch_srcs[i], split->prefetch_copies[i]);
+        ggml_backend_sched_prefetch_copy(sched, split->backend_id, split->prefetch_srcs[i], split->prefetch_copies[i]);
     }
 }
 
@@ -2557,6 +2597,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
     const char * GGML_SCHED_DEBUG_PREFETCH = getenv("GGML_SCHED_DEBUG_PREFETCH");
     sched->debug_prefetch = GGML_SCHED_DEBUG_PREFETCH ? atoi(GGML_SCHED_DEBUG_PREFETCH) : 0;
     sched->prefetch_slot_limit = (size_t) 256 << 20; // Keep the pack small enough for the staging copy to overlap compute.
+    sched->prefetch_peer = getenv("GGML_SCHED_PREFETCH_NO_PEER") == NULL;
 
     sched->debug_realloc = 0;
 #ifdef GGML_SCHED_NO_REALLOC
@@ -2612,6 +2653,18 @@ ggml_backend_sched_t ggml_backend_sched_new(
         sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
         GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
 
+        // the backend may be able to copy weights from another device on its own
+        ggml_backend_dev_t dev = ggml_backend_get_device(backends[b]);
+        ggml_backend_reg_t reg = dev != NULL ? ggml_backend_dev_backend_reg(dev) : NULL;
+        if (reg != NULL) {
+            ggml_backend_peer_copy_async_t       copy_async = (ggml_backend_peer_copy_async_t)       ggml_backend_reg_get_proc_address(reg, "ggml_backend_peer_copy_async");
+            ggml_backend_peer_copy_synchronize_t copy_sync  = (ggml_backend_peer_copy_synchronize_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_peer_copy_synchronize");
+            if (copy_async != NULL && copy_sync != NULL) {
+                sched->peer_copy_async[b] = copy_async;
+                sched->peer_copy_sync[b]  = copy_sync;
+            }
+        }
+
         if (sched->n_copies > 1) {
             for (int c = 0; c < sched->n_copies; c++) {
                 sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
@@ -2640,6 +2693,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         return;
     }
     for (int b = 0; b < sched->n_backends; b++) {
+        // copies still running write into the staging buffer
+        if (sched->peer_copy_sync[b] != NULL) {
+            sched->peer_copy_sync[b](sched->backends[b]);
+        }
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
         }
