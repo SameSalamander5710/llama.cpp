@@ -1185,16 +1185,47 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML
 #define GET_CAUSE(node) ""
 #endif
 
-// returns the device backend that already holds the other inputs of `tensor`, that is the device
-// that owns the layer, or -1 if none of them sits on a device that wants the op
+// true if `t` is a weight, looking through views
+static bool ggml_backend_sched_is_weight(const struct ggml_tensor * t) {
+    ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
+    return buf != NULL && ggml_backend_buffer_get_usage(buf) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+}
+
+// the backend that `t` runs on or will run on. An op without weights has no backend until the expansion sweeps ran, so look through it at its own inputs to find where its data comes from
+static int ggml_backend_sched_activation_backend_id(ggml_backend_sched_t sched, struct ggml_tensor * t, int depth) {
+    int backend_id = tensor_backend_id(t);
+    if (backend_id == -1 && t->view_src != NULL) {
+        backend_id = tensor_backend_id(t->view_src);
+    }
+    if (backend_id != -1) {
+        return backend_id;
+    }
+    if (depth <= 0 || t->buffer != NULL || ggml_backend_sched_is_weight(t)) {
+        return -1;
+    }
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        struct ggml_tensor * src = t->src[i];
+        if (src == NULL || ggml_backend_sched_is_weight(src)) {
+            continue;
+        }
+        backend_id = ggml_backend_sched_activation_backend_id(sched, src, depth - 1);
+        if (backend_id != -1 && backend_id < sched->n_backends && !ggml_backend_buft_is_host(sched->bufts[backend_id])) {
+            return backend_id;
+        }
+    }
+    return -1;
+}
+
+// the device backend that holds the activations feeding `tensor`, that is the device that owns the layer, or -1 if none of them sits on a device that wants the op. weight_backend_id is the backend the weight would pull the op to, it is skipped
 static int ggml_backend_sched_backend_id_from_other_srcs(
         ggml_backend_sched_t sched, struct ggml_tensor * tensor, int weight_backend_id) {
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         struct ggml_tensor * src = tensor->src[i];
-        if (src == NULL || (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS)) {
+        if (src == NULL || ggml_backend_sched_is_weight(src)) {
             continue;
         }
-        const int backend_id = tensor_backend_id(src);
+        // the producer of the activation may not have a backend yet, since the sweeps did not run
+        const int backend_id = ggml_backend_sched_activation_backend_id(sched, src, 8);
         if (backend_id == -1 || backend_id == weight_backend_id || backend_id >= sched->n_backends) {
             continue;
         }
@@ -1210,8 +1241,6 @@ static int ggml_backend_sched_backend_id_from_other_srcs(
 }
 
 // returns the backend that should be used for the node based on the current locations
-static int ggml_backend_sched_prefetch_place(ggml_backend_sched_t sched, struct ggml_tensor * node);
-
 static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
     // assign pre-allocated nodes to their backend
     int cur_backend_id = ggml_backend_sched_backend_from_buffer(sched, tensor, tensor);
@@ -1260,15 +1289,6 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
             }
             if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                 int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
-                if (sched->prefetch) {
-                    // place the op before the expansion sweeps, so the ops without weights in the
-                    // chain follow it instead of staying with the weight
-                    const int pf_backend_id = ggml_backend_sched_prefetch_place(sched, tensor);
-                    if (pf_backend_id != -1) {
-                        SET_CAUSE(tensor, "1.pf");
-                        return pf_backend_id;
-                    }
-                }
                 // check if a backend with higher prio wants to offload the op
                 if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
                     for (int b = 0; b < src_backend_id; b++) {
@@ -1360,12 +1380,13 @@ static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, stru
 
 // the backend that holds the rest of the layer of `node`, when the weight of `node` sits in the memory of another device and prefetch can stream it there, or -1 to keep the current backend
 static int ggml_backend_sched_prefetch_place(ggml_backend_sched_t sched, struct ggml_tensor * node) {
-    if (!sched->prefetch || node->view_src != NULL) {
+    // a pre-allocated node cannot move
+    if (!sched->prefetch || node->view_src != NULL || node->buffer != NULL) {
         return -1;
     }
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         struct ggml_tensor * src = node->src[i];
-        if (src == NULL || src->buffer == NULL || src->buffer->usage != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+        if (src == NULL || !ggml_backend_sched_is_weight(src)) {
             continue;
         }
         const int weight_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, node);
@@ -1568,6 +1589,28 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         }
     }
 
+    // pass 1b: place the ops that own a weight from another device (prefetch)
+    // this has to run before the expansion sweeps, because the sweeps copy the backend of a node to its unassigned neighbours.
+    // An op that is still with its weight at that point pulls the ops of the chain around it (norm, silu, mul, residual add) onto the weight device with it, and the ops behind them no longer find the layer device where their activations are.
+    // nodes are visited in graph order, so a placed op is seen by the ops that consume it
+    if (sched->prefetch) {
+        for (int i = 0; i < graph->n_nodes; i++) {
+            struct ggml_tensor * node = graph->nodes[i];
+            if (ggml_is_view_op(node->op)) {
+                continue;
+            }
+            int * node_backend_id = &tensor_backend_id(node);
+            if (*node_backend_id == -1) {
+                continue;
+            }
+            const int pf_backend_id = ggml_backend_sched_prefetch_place(sched, node);
+            if (pf_backend_id != -1) {
+                *node_backend_id = pf_backend_id;
+                SET_CAUSE(node, "1b.pf");
+            }
+        }
+    }
+
     // pass 2: expand current backend assignments
     // assign the same backend to adjacent nodes
     // expand gpu backends (i.e. non last prio) up and down, ignoring cpu (the lowest priority backend)
@@ -1707,8 +1750,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 }
             }
         }
-        // the weight sits in the memory of another device, so run the op where the rest of the layer
-        // is and let prefetch stream the weight there
+        // fallback for the ops that only got a backend after pass 1b, their weight sits in the memory of another device, so run them where the rest of the layer is and let prefetch stream the weight there
         const int pf_backend_id = ggml_backend_sched_prefetch_place(sched, node);
         if (pf_backend_id != -1) {
             *node_backend_id = pf_backend_id;
