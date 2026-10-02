@@ -58,6 +58,8 @@ void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& src, size
 // direct device to device copies, see ggml-vulkan-buffers.cpp
 void ggml_vk_init_direct_copy(vk_device& device, const std::vector<vk::PhysicalDevice> & peers);
 int  ggml_vk_copy_mode();
+// turn the per-device peer copy paths on or off at run time, see ggml_vk_copy_mode
+void ggml_vk_set_peer_copy(bool enabled);
 const char * ggml_vk_handle_type_name(vk::ExternalMemoryHandleTypeFlagBits type);
 bool ggml_vk_same_physical_device(const vk::PhysicalDeviceIDProperties & a, const vk::PhysicalDeviceIDProperties & b);
 bool ggml_vk_can_import_from(vk::PhysicalDevice pd, const vk::PhysicalDeviceIDProperties & pd_id, const vk_device & exporter,
