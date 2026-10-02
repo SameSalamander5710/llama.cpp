@@ -1689,6 +1689,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"-ptp", "--peer-to-peer"},
+        "copy tensors that cross devices with the peer copy path, direct then shared staging then host staging; off copies through host staging with a CPU copy (dense models only, disabled by default)",
+        [](common_params & params) {
+            params.peer_to_peer = true;
+        }
+    ));
+    add_opt(common_arg(
         {"--keep"}, "N",
         string_format("number of tokens to keep from the initial prompt (default: %d, -1 = all)", params.n_keep),
         [](common_params & params, int value) {

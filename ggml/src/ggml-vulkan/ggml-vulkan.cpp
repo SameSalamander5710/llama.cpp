@@ -13524,6 +13524,12 @@ static void ggml_backend_vk_peer_copy_synchronize(ggml_backend_t backend_dst) {
     ggml_vk_peer_copy_synchronize((ggml_backend_vk_context *)backend_dst->context);
 }
 
+// turns the peer copy paths of the Vulkan devices on or off, see ggml-backend-impl.h
+static void ggml_backend_vk_peer_copy_set(bool enabled) {
+    VK_LOG_DEBUG("ggml_backend_vk_peer_copy_set(" << enabled << ")");
+    ggml_vk_set_peer_copy(enabled);
+}
+
 static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
     VK_LOG_DEBUG("ggml_backend_vk_synchronize()");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
@@ -16258,6 +16264,9 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     }
     if (strcmp(name, "ggml_backend_peer_copy_synchronize") == 0) {
         return (void *) ggml_backend_vk_peer_copy_synchronize;
+    }
+    if (strcmp(name, "ggml_backend_peer_copy_set") == 0) {
+        return (void *) ggml_backend_vk_peer_copy_set;
     }
     // void ggml_backend_vk_get_copy_stats(size_t * direct_bytes, size_t * shared_bytes, size_t * host_bytes)
     // bytes copied between devices straight out of the memory of the other device, through memory shared by both

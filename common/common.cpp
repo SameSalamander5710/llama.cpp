@@ -1338,7 +1338,21 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
     return pimpl->lora;
 }
 
+// the peer copy paths of the backends are off by default and the tools turn them on with --peer-to-peer
+static void common_set_peer_copy(bool enabled) {
+    typedef void (*ggml_backend_peer_copy_set_t)(bool enabled);
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        auto * reg = ggml_backend_dev_backend_reg(ggml_backend_dev_get(i));
+        auto * set_fn = (ggml_backend_peer_copy_set_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_peer_copy_set");
+        if (set_fn != nullptr) {
+            set_fn(enabled);
+        }
+    }
+}
+
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+    common_set_peer_copy(params.peer_to_peer);
+
     common_init_result_ptr res(new common_init_result(params, model_only));
 
     llama_model * model = res->model();

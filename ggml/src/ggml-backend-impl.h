@@ -256,6 +256,10 @@ extern "C" {
     typedef bool (*ggml_backend_peer_copy_async_t)(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst);
     typedef void (*ggml_backend_peer_copy_synchronize_t)(ggml_backend_t backend_dst);
 
+    // Optional backend extension: turn the peer copy paths of a backend on or off at run time.
+    // A backend that has it returns a function from get_proc_address under the name "ggml_backend_peer_copy_set".
+    typedef void (*ggml_backend_peer_copy_set_t)(bool enabled);
+
     // Add backend dynamic loading support to the backend
 
     // Initialize the backend

@@ -1,5 +1,6 @@
 #include "ggml-vulkan-common.h"
 
+#include <atomic>
 #include <cstdlib>
 #include <mutex>
 #if !defined(_WIN32)
@@ -737,15 +738,25 @@ void ggml_vk_buffer_copy_async(vk_context& ctx, vk_buffer& dst, size_t dst_offse
 //   2        shared staging, then host staging
 //   3        like 1, and also tries opaque handles between different physical devices. The Vulkan specification only
 //            guarantees those to work within one physical device, but some drivers accept them. Verified like the rest.
+// The tools set the mode at run time, which is what --peer-to-peer does, and the environment overrides that.
 // ---------------------------------------------------------------------------------------------------------------------
 
+static std::atomic<int> ggml_vk_copy_mode_flag{ -1 };
+
+void ggml_vk_set_peer_copy(bool enabled) {
+    ggml_vk_copy_mode_flag.store(enabled ? 1 : 0);
+}
+
 int ggml_vk_copy_mode() {
-    static const int mode = []() {
+    static const int env_mode = []() {
         const char * env = getenv("GGML_VK_DIRECT_COPY");
-        const int value = env ? atoi(env) : 1;
-        return value >= 0 && value <= 3 ? value : 1;
+        return env ? atoi(env) : -1;
     }();
-    return mode;
+    int mode = env_mode >= 0 ? env_mode : ggml_vk_copy_mode_flag.load();
+    if (mode < 0) {
+        mode = 1;
+    }
+    return mode >= 0 && mode <= 3 ? mode : 1;
 }
 
 // The opaque handle of the platform, the one that exists on every driver that can share memory at all
