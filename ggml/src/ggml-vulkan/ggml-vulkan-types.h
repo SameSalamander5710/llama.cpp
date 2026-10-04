@@ -740,6 +740,9 @@ struct vk_device_struct {
     bool integer_dot_product;
     // 0: default, 1: force mmvq, -1: disable mmvq
     int32_t mmvq_mode;
+    // smallest number of columns for which Q6_K uses the integer dot product mat-vec, 0: never (stock behaviour).
+    // Intel always may use it, see ggml_vk_should_use_mmvq. Set by ggml_vk_q6k_mmvq_min_n.
+    uint32_t q6k_mmvq_min_n = 0;
 
     bool subgroup_size_control;
     uint32_t subgroup_min_size;
@@ -1208,22 +1211,36 @@ class vk_perf_logger {
     std::string get_node_fusion_name(const ggml_tensor * node, const char *fusion_name, uint64_t *n_flops);
 
 
+    // bytes of weights a mat-vec streams, 0 for every other node
+    static uint64_t weight_bytes(const ggml_tensor * node) {
+        if (node->op == GGML_OP_MUL_MAT && node->ne[1] <= mul_mat_vec_max_cols && node->src[0] != nullptr &&
+            ggml_is_quantized(node->src[0]->type)) {
+            return ggml_nbytes(node->src[0]);
+        }
+        return 0;
+    }
+
     void log_timing(const ggml_tensor * node, const char *fusion_name, uint64_t time) {
         uint64_t n_flops;
         std::string name = get_node_fusion_name(node, fusion_name, &n_flops);
         if (n_flops) {
             flops[name].push_back(n_flops);
         }
+        if (const uint64_t wb = weight_bytes(node)) {
+            wbytes[name].push_back(wb);
+        }
         timings[name].push_back(time);
     }
 
     void log_timing(const std::vector<ggml_tensor *> &nodes, const std::vector<const char *> &names, uint64_t time) {
         uint64_t total_flops = 0;
+        uint64_t total_wbytes = 0;
         std::string name;
         for (size_t n = 0; n < nodes.size(); ++n) {
             uint64_t n_flops = 0;
             name += get_node_fusion_name(nodes[n], names[n], &n_flops);
             total_flops += n_flops;
+            total_wbytes += weight_bytes(nodes[n]);
 
             if (n != nodes.size() - 1) {
                 name += ", ";
@@ -1232,12 +1249,16 @@ class vk_perf_logger {
         if (total_flops) {
             flops[name].push_back(total_flops);
         }
+        if (total_wbytes) {
+            wbytes[name].push_back(total_wbytes);
+        }
         timings[name].push_back(time);
     }
 
   private:
     std::map<std::string, std::vector<uint64_t>> timings;
     std::map<std::string, std::vector<uint64_t>> flops;
+    std::map<std::string, std::vector<uint64_t>> wbytes; // weight bytes streamed by mat-vec nodes
     uint32_t print_count {};
 };
 
