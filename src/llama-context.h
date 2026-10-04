@@ -381,6 +381,9 @@ private:
 
     llm_graph_result * gf_res_prev_active = nullptr;
 
+    // whether the active graph was split and allocated with weight prefetch on, a graph is only reused under the same setting
+    bool gf_res_prev_prefetch = false;
+
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 

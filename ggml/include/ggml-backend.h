@@ -359,7 +359,6 @@ extern "C" {
     // Enable or disable staging of remote weights into device memory during graph compute.
     // Call it before the graph is split so the staging buffers get their size. Default: off.
     GGML_API void                 ggml_backend_sched_set_prefetch(ggml_backend_sched_t sched, bool prefetch);
-    GGML_API bool                 ggml_backend_sched_get_prefetch(ggml_backend_sched_t sched);
 
     //
     // Meta backend

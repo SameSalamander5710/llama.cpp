@@ -2848,11 +2848,6 @@ void ggml_backend_sched_set_prefetch(ggml_backend_sched_t sched, bool prefetch) 
     sched->prefetch = prefetch;
 }
 
-bool ggml_backend_sched_get_prefetch(ggml_backend_sched_t sched) {
-    GGML_ASSERT(sched);
-    return sched->prefetch;
-}
-
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->n_splits;

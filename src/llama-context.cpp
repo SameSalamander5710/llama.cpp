@@ -1417,7 +1417,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    const bool prefetch = llama_context_should_prefetch(cparams, ubatch.n_tokens);
+
+    if (!graph_reuse_disable && gf_res_prev_active == res && gf_res_prev_prefetch == prefetch && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1436,7 +1438,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
         // stage weights that are not resident on the compute device into device memory, for real prefill-sized ubatches
-        ggml_backend_sched_set_prefetch(sched.get(), llama_context_should_prefetch(cparams, ubatch.n_tokens));
+        ggml_backend_sched_set_prefetch(sched.get(), prefetch);
 
         //const auto t_start_us = ggml_time_us();
 
@@ -1456,7 +1458,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        gf_res_prev_active = res;
+        gf_res_prev_active   = res;
+        gf_res_prev_prefetch = prefetch;
     }
 
     // set the input data for the input tensors
@@ -1468,9 +1471,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
-
-    // the graph was built under this prefetch state; graph reuse requires equal n_tokens
-    GGML_ASSERT(ggml_backend_sched_get_prefetch(sched.get()) == llama_context_should_prefetch(cparams, ubatch.n_tokens));
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
