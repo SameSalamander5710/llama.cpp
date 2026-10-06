@@ -80,8 +80,9 @@ vk_peer_path ggml_vk_peer_copy_try(vk_buffer & src, size_t src_offset, vk_buffer
 // whether src is known to be readable by dst, which makes a copy that is recorded into the commands of dst possible
 bool ggml_vk_peer_direct_ready(vk_buffer & src, vk_device & dst);
 // Small copies between devices, like the activations that cross between two devices for every layer, that do not
-// block on the destination. GGML_VK_PEER_SMALL_COPY: 0 = off (default), 1 = a small blocking copy is written into the
-// destination by the CPU when its memory is mapped, 2 = also the asynchronous copy below.
+// block on the destination. GGML_VK_PEER_SMALL_COPY: 0 = off, 1 = a small blocking copy is written into the
+// destination by the CPU when its memory is mapped, 2 = the asynchronous copy below. The default is 2 while the
+// peer copy paths are on, 0 while they are off, see ggml_vk_set_peer_copy.
 int  ggml_vk_peer_small_copy_mode();
 // A slot of shared staging memory that a small copy goes through. The source device writes it, the destination device
 // reads it. It stays in use until the destination backend has finished the work that was recorded with the copy.

@@ -24,7 +24,7 @@
 //
 // GGML_VK_DIRECT_COPY chooses what is allowed (see ggml-vulkan-buffers.cpp), GGML_VK_COPY_CHUNK_MB the size of the chunks of shared staging, 16 by default. GGML_VK_PEER_COPY_FORCE_STAGING makes everything use path 3. The environment variables of this file are read once.
 //
-// Small copies (up to vk_peer_small_max, like the activations of one layer when the weights of its FFN are on another device) are dominated by the latency of the hops, not by the bandwidth. GGML_VK_PEER_SMALL_COPY:
+// Small copies (up to vk_peer_small_max, like the activations of one layer when the weights of its FFN are on another device) are dominated by the latency of the hops, not by the bandwidth. GGML_VK_PEER_SMALL_COPY selects the mode, 0 = off. The default is 2 while the peer copy paths are on and 0 while they are off:
 //   1. a small blocking copy through shared staging is one hop on the source device, and then the CPU writes the bytes into the destination if its memory is mapped (host visible and coherent, write combined is fine for a write), instead of a second hop with its own submit and fence.
 //   2. a small copy that the scheduler asks for as asynchronous, which on a pair without a direct path would otherwise take the blocking copy, is recorded instead: the source device copies into a slot of a ring of shared staging memory, in a command buffer that the synchronization of the source backend submits anyway, and the destination device copies out of the slot in the commands of the destination backend, so it has no submit and no fence of its own. A slot is free again when the destination backend has synchronized.
 //
@@ -217,11 +217,14 @@ static constexpr uint32_t vk_peer_ring_slots = 32;
 int ggml_vk_peer_small_copy_mode() {
     static const int mode = []() {
         const char * env = getenv("GGML_VK_PEER_SMALL_COPY");
-        const int m = env ? std::min(std::max(atoi(env), 0), 2) : 0;
+        const int m = env ? std::min(std::max(atoi(env), 0), 2) : -1;
+        // the tools enable the peer copy paths at run time (--peer-to-peer, ggml_vk_set_peer_copy). They are on, so a
+        // small copy takes mode 2 unless the variable says otherwise
+        const int d = ggml_vk_copy_mode() != 0 ? 2 : 0;
         if (m > 0 && ggml_vk_copy_mode() == 0) {
             GGML_LOG_WARN("ggml_vulkan: GGML_VK_PEER_SMALL_COPY=%d has no effect while the peer copy paths are off, pass --peer-to-peer\n", m);
         }
-        return m;
+        return m >= 0 ? m : d;
     }();
     return mode;
 }
