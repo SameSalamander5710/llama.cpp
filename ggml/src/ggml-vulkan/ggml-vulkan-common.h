@@ -79,6 +79,25 @@ enum vk_peer_path {
 vk_peer_path ggml_vk_peer_copy_try(vk_buffer & src, size_t src_offset, vk_buffer & dst, size_t dst_offset, size_t size);
 // whether src is known to be readable by dst, which makes a copy that is recorded into the commands of dst possible
 bool ggml_vk_peer_direct_ready(vk_buffer & src, vk_device & dst);
+// Small copies between devices, like the activations that cross between two devices for every layer, that do not
+// block on the destination. GGML_VK_PEER_SMALL_COPY: 0 = off (default), 1 = a small blocking copy is written into the
+// destination by the CPU when its memory is mapped, 2 = also the asynchronous copy below.
+int  ggml_vk_peer_small_copy_mode();
+// A slot of shared staging memory that a small copy goes through. The source device writes it, the destination device
+// reads it. It stays in use until the destination backend has finished the work that was recorded with the copy.
+struct vk_peer_slot {
+    std::shared_ptr<vk_peer_pair> pair;
+    vk_buffer src_view;   // of the source device
+    vk_buffer dst_view;   // of the destination device
+    size_t    offset = 0;
+};
+// false if the pair is not set up for it (no verified shared staging yet, no free slot, too big, mode < 2). owner is
+// the backend of the destination device
+bool ggml_vk_peer_slot_acquire(vk_buffer & src, vk_buffer & dst, const void * owner, size_t size, vk_peer_slot & slot);
+// the slot was acquired but no copy was recorded for it
+void ggml_vk_peer_slot_abandon(vk_peer_slot & slot);
+// the backend has finished all the work it was given, so the slots that were acquired for it are free again
+void ggml_vk_peer_slots_release(ggml_backend_vk_context * ctx);
 // count bytes copied, for ggml_vk_copy_stats
 void ggml_vk_peer_count_host_bytes(size_t size);
 void ggml_vk_peer_count_direct_bytes(size_t size);

@@ -13336,6 +13336,57 @@ static void ggml_backend_vk_get_tensor_async(ggml_backend_t backend, const ggml_
     ggml_backend_vk_get_tensor_2d_async(backend, tensor, data, offset, size, 1, size, size);
 }
 
+// A small tensor from another device over the shared staging memory, without the blocking copy (GGML_VK_PEER_SMALL_COPY=2).
+// Only used when there is no direct path between the devices. The blocking copy is two hops, each with its own submit
+// and fence, and the scheduler synchronizes both backends around it. Here the source device copies into a slot in
+// the command buffer that the synchronization of the source backend submits anyway, and the destination device copies
+// out of the slot in the commands of the destination backend, behind the work it already has: one fence wait in all.
+static bool ggml_vk_cpy_tensor_shared_async(ggml_backend_t backend_src, ggml_backend_vk_context * ctx_dst, const ggml_tensor * src, ggml_tensor * dst,
+                                            vk_buffer & src_buf, vk_buffer & dst_buf) {
+    if (ggml_vk_peer_small_copy_mode() < 2 || backend_src == nullptr || !ggml_backend_is_vk(backend_src)) {
+        return false;
+    }
+    // weights are for the prefetch, and the copy of an activation needs the source to be done
+    if (ggml_backend_buffer_get_usage(src->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+        return false;
+    }
+    ggml_backend_vk_context * ctx_src = (ggml_backend_vk_context *)backend_src->context;
+    if (ctx_src->device != src_buf->device) {
+        return false;
+    }
+
+    const size_t size = ggml_nbytes(src);
+    vk_peer_slot slot;
+    if (!ggml_vk_peer_slot_acquire(src_buf, dst_buf, ctx_dst, size, slot)) {
+        return false;
+    }
+
+    // source tensor -> slot. This starts a context after the graph that produced the tensor, which was submitted
+    // already, so the barrier makes the copy wait for it (a barrier covers everything earlier in the queue). The
+    // synchronization submits the context and waits for the fence, so the slot is filled when it returns.
+    vk_context src_ctx = ggml_vk_get_compute_ctx(ctx_src);
+    ggml_vk_sync_buffers(ctx_src, src_ctx);
+    ggml_vk_buffer_copy_async(src_ctx, slot.src_view, slot.offset, src_buf, vk_tensor_offset(src) + src->view_offs, size);
+    ggml_backend_synchronize(backend_src);
+
+    // slot -> destination tensor, recorded in the commands of the destination backend. The slot stays taken until
+    // that backend synchronizes (ggml_vk_synchronize), when the copy is certainly done.
+    vk_context cpy_ctx;
+    if (ctx_dst->device->async_use_transfer_queue) {
+        cpy_ctx = ggml_vk_get_transfer_ctx(ctx_dst);
+    } else {
+        cpy_ctx = ggml_vk_get_compute_ctx(ctx_dst);
+    }
+    ggml_vk_buffer_copy_async(cpy_ctx, dst_buf, vk_tensor_offset(dst) + dst->view_offs, slot.dst_view, slot.offset, size);
+    // what the destination backend records after this reads the tensor. Not on the transfer queue: a barrier with
+    // compute stages is not valid there, and the compute queue waits for the transfer context with its semaphore,
+    // like it does for the direct copy
+    if (!ctx_dst->device->async_use_transfer_queue) {
+        ggml_vk_sync_buffers(ctx_dst, cpy_ctx);
+    }
+    return true;
+}
+
 static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_backend_vk_cpy_tensor_async(" << src << " -> " << dst << ", size=" << ggml_nbytes(src) << ")");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend_dst->context;
@@ -13360,7 +13411,8 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
             // Only when the pair of devices has been verified to share memory. The first copy between them is a
             // blocking one that checks it, so this falls back to that.
             if (!ggml_vk_buffer_copy_direct_ready(src_buf_ctx->dev_buffer, dst_buf->device)) {
-                return false;
+                // no direct path: a small tensor can still go over shared staging without a blocking copy
+                return ggml_vk_cpy_tensor_shared_async(backend_src, ctx, src, dst, src_buf_ctx->dev_buffer, dst_buf);
             }
 
             // The scheduler does not wait for the source backend when the copy is asynchronous, so the data the
@@ -13498,6 +13550,9 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
         }
         ctx->compute_ctx.reset();
     }
+
+    // everything this backend was given has finished, including the copies out of the slots of shared staging
+    ggml_vk_peer_slots_release(ctx);
 }
 
 // copies a tensor from the memory of another Vulkan device without blocking, see ggml-backend-impl.h. The copy is made by a worker thread with resources of its own, since the blocking copy between devices cannot run while the backends have work in flight

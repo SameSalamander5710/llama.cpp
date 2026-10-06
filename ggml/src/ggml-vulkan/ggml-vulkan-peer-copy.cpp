@@ -22,7 +22,11 @@
 //
 // Each path of a pair is verified with real data the first time it is used, because a driver that advertises memory sharing may still not make it work between two particular devices. A pair that fails moves on to the next. Verification, the copies of 1 and 2, and the blocking copy between devices all use command pools, fences and a queue submit of their own like the worker below does, so none of them has to wait for the backends to be idle.
 //
-// GGML_VK_DIRECT_COPY chooses what is allowed (see ggml-vulkan-buffers.cpp), GGML_VK_COPY_CHUNK_MB the size of the chunks of shared staging, 16 by default. GGML_VK_PEER_COPY_FORCE_STAGING makes everything use path 3.
+// GGML_VK_DIRECT_COPY chooses what is allowed (see ggml-vulkan-buffers.cpp), GGML_VK_COPY_CHUNK_MB the size of the chunks of shared staging, 16 by default. GGML_VK_PEER_COPY_FORCE_STAGING makes everything use path 3. The environment variables of this file are read once.
+//
+// Small copies (up to vk_peer_small_max, like the activations of one layer when the weights of its FFN are on another device) are dominated by the latency of the hops, not by the bandwidth. GGML_VK_PEER_SMALL_COPY:
+//   1. a small blocking copy through shared staging is one hop on the source device, and then the CPU writes the bytes into the destination if its memory is mapped (host visible and coherent, write combined is fine for a write), instead of a second hop with its own submit and fence.
+//   2. a small copy that the scheduler asks for as asynchronous, which on a pair without a direct path would otherwise take the blocking copy, is recorded instead: the source device copies into a slot of a ring of shared staging memory, in a command buffer that the synchronization of the source backend submits anyway, and the destination device copies out of the slot in the commands of the destination backend, so it has no submit and no fence of its own. A slot is free again when the destination backend has synchronized.
 //
 // The blocking copy (ggml_vk_buffer_copy) does this with a command buffer and a fence per hop and cannot run while the backends have work in flight, because it recycles the command pools of the device queues. This file does the same hops on a worker thread of its own, so the caller can launch compute on the destination device while the copy streams in.
 // The worker touches nothing a backend uses. It has its own command pool, command buffers, fences and staging buffers per device, and the only state it shares with the backends is the queue submit handle, which carries its own lock. It never frees or resets anything that is in flight.
@@ -44,13 +48,29 @@ struct vk_peer_job {
     size_t    size;
 };
 
+// read once, the copies check these for every hop
+bool vk_peer_force_staging() {
+    static const bool force = getenv("GGML_VK_PEER_COPY_FORCE_STAGING") != nullptr;
+    return force;
+}
+
 bool vk_peer_host_accessible(const vk_buffer & buf) {
     // GGML_VK_PEER_COPY_FORCE_STAGING makes every buffer take the staged path, to test that path on devices where all memory is host visible
-    if (getenv("GGML_VK_PEER_COPY_FORCE_STAGING") != nullptr) {
+    if (vk_peer_force_staging()) {
         return false;
     }
     // HostCached is required. Without it the memory is write-combined over the PCIe aperture and a host memcpy of it runs at a fraction of the bus speed, so such a buffer is staged instead.
     const vk::MemoryPropertyFlags need = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached;
+    return buf->ptr != nullptr && (buf->memory_property_flags & need) == need;
+}
+
+// Memory the CPU can write and the device sees without a flush. Unlike host_accessible it need not be cached, since
+// it is only written (write combined memory over the PCIe aperture is fast for that).
+bool vk_peer_host_writable(const vk_buffer & buf) {
+    if (vk_peer_force_staging()) {
+        return false;
+    }
+    const vk::MemoryPropertyFlags need = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent;
     return buf->ptr != nullptr && (buf->memory_property_flags & need) == need;
 }
 
@@ -148,6 +168,11 @@ struct vk_peer_side {
 static std::atomic<size_t> vk_copy_direct_bytes {0};
 static std::atomic<size_t> vk_copy_shared_bytes {0};
 static std::atomic<size_t> vk_copy_host_bytes   {0};
+// asynchronous small copies: done, and the ones that fell back to the blocking copy and why
+static std::atomic<size_t> vk_small_async      {0};
+static std::atomic<size_t> vk_small_unverified {0}; // the first copy of a pair is a blocking one, it verifies the shared staging
+static std::atomic<size_t> vk_small_ring_full  {0};
+static std::atomic<size_t> vk_small_ring_failed{0};
 
 void ggml_vk_copy_stats(size_t * direct_bytes, size_t * shared_bytes, size_t * host_bytes) {
     *direct_bytes = vk_copy_direct_bytes.load();
@@ -183,6 +208,24 @@ static void vk_pinned_free(void * ptr) {
 #endif
 }
 
+// a copy of up to this many bytes is a small copy, see GGML_VK_PEER_SMALL_COPY
+static constexpr size_t   vk_peer_small_max  = 256u << 10;
+// slots of the ring of the asynchronous small copies. A split of the graph takes a few of them, and they are all free
+// again when the destination backend synchronizes, which it does for every hop back
+static constexpr uint32_t vk_peer_ring_slots = 32;
+
+int ggml_vk_peer_small_copy_mode() {
+    static const int mode = []() {
+        const char * env = getenv("GGML_VK_PEER_SMALL_COPY");
+        const int m = env ? std::min(std::max(atoi(env), 0), 2) : 0;
+        if (m > 0 && ggml_vk_copy_mode() == 0) {
+            GGML_LOG_WARN("ggml_vulkan: GGML_VK_PEER_SMALL_COPY=%d has no effect while the peer copy paths are off, pass --peer-to-peer\n", m);
+        }
+        return m;
+    }();
+    return mode;
+}
+
 // What the copies from the device src into the device dst use. One copy at a time uses a pair.
 struct vk_peer_pair {
     vk_peer_pair(const vk_device & src_, const vk_device & dst_) : src(src_), dst(dst_) {}
@@ -194,6 +237,9 @@ struct vk_peer_pair {
         ggml_vk_destroy_buffer(src_view);
         ggml_vk_destroy_buffer(dst_view);
         vk_pinned_free(host);
+        ggml_vk_destroy_buffer(ring_src_view);
+        ggml_vk_destroy_buffer(ring_dst_view);
+        vk_pinned_free(ring_host);
     }
 
     vk_peer_pair(const vk_peer_pair &) = delete;
@@ -205,7 +251,7 @@ struct vk_peer_pair {
     std::mutex mutex;
 
     std::atomic<int> direct_state { 0 }; // 0 = not verified yet, 1 = usable, -1 = not usable
-    int              shared_state = 0;
+    std::atomic<int> shared_state { 0 }; // same. Atomic because the slots of the ring are acquired without the mutex
 
     // command pool, fences and queue submit of each device, for the copies of the two paths
     std::unique_ptr<vk_peer_side> src_side;
@@ -216,6 +262,18 @@ struct vk_peer_pair {
     size_t    slot_size = 0;
     vk_buffer src_view;
     vk_buffer dst_view;
+
+    // asynchronous small copies: a ring of slots in a pinned allocation of its own. A slot is read by the destination
+    // device after the call that filled it has returned, while the blocking copies go on using the two chunk slots
+    // above. Guarded by ring_mutex, not by mutex, which a blocking copy holds for as long as it takes.
+    std::mutex   ring_mutex;
+    void *       ring_host      = nullptr;
+    size_t       ring_slot_size = 0;
+    vk_buffer    ring_src_view;
+    vk_buffer    ring_dst_view;
+    bool         ring_failed    = false;
+    uint32_t     ring_next      = 0;
+    const void * ring_owner[vk_peer_ring_slots] = {}; // the backend that has to synchronize before the slot is free, null = free
 };
 
 static std::shared_ptr<vk_peer_pair> vk_peer_pair_get(vk_device & src, vk_device & dst, bool create) {
@@ -256,6 +314,23 @@ static bool vk_peer_run_direct(vk_peer_pair & p, vk_buffer & src, size_t src_off
 
 // ---- shared staging
 
+static bool vk_peer_ring_create(vk_peer_pair & p) {
+    if (!p.src->external_memory_host || !p.dst->external_memory_host) {
+        return false;
+    }
+    const size_t align = std::max<size_t>(std::max<size_t>(p.src->min_imported_host_pointer_alignment, p.dst->min_imported_host_pointer_alignment), 1);
+    p.ring_slot_size = (vk_peer_small_max + align - 1) / align * align;
+    const size_t total = vk_peer_ring_slots * p.ring_slot_size;
+
+    p.ring_host = vk_pinned_alloc(total);
+    if (p.ring_host == nullptr || (reinterpret_cast<uintptr_t>(p.ring_host) & (align - 1))) {
+        return false;
+    }
+    p.ring_src_view = ggml_vk_buffer_from_host_ptr(p.src, p.ring_host, total);
+    p.ring_dst_view = ggml_vk_buffer_from_host_ptr(p.dst, p.ring_host, total);
+    return p.ring_src_view && p.ring_dst_view;
+}
+
 static bool vk_peer_shared_create(vk_peer_pair & p) {
     if (!p.src->external_memory_host || !p.dst->external_memory_host) {
         return false;
@@ -294,6 +369,21 @@ static void vk_peer_run_shared(vk_peer_pair & p, vk_buffer & src, size_t src_off
     const size_t slot    = p.slot_size;
     const size_t n_chunk = (size + slot - 1) / slot;
     auto chunk_len = [&](size_t k) { return std::min(slot, size - k*slot); };
+
+    // A copy that fits in one chunk has nothing to overlap, so it skips the pipeline: one hop on each device.
+    if (size <= slot) {
+        src_side.submit_copy(0, src->buffer, src_offset, p.src_view->buffer, 0, size);
+        src_side.wait(0);
+        if (size <= vk_peer_small_max && ggml_vk_peer_small_copy_mode() >= 1 && vk_peer_host_writable(dst)) {
+            // the second hop would be a submit and a fence for a few KiB, the CPU writes them into the destination.
+            // The device sees the write with the next submit, as for any write to mapped memory
+            memcpy((uint8_t *) dst->ptr + dst_offset, p.host, size);
+        } else {
+            dst_side.submit_copy(0, p.dst_view->buffer, 0, dst->buffer, dst_offset, size);
+            dst_side.wait(0);
+        }
+        return;
+    }
 
     // buffer of the source device -> slot of the staging memory
     auto read_chunk = [&](size_t k) {
@@ -411,10 +501,6 @@ static bool vk_peer_verify_shared(vk_peer_pair & p) {
 
 // ---- entry points
 
-static bool vk_peer_force_staging() {
-    return getenv("GGML_VK_PEER_COPY_FORCE_STAGING") != nullptr;
-}
-
 vk_peer_path ggml_vk_peer_copy_try(vk_buffer & src, size_t src_offset, vk_buffer & dst, size_t dst_offset, size_t size) {
     if (src->device == dst->device || size == 0) {
         return VK_PEER_PATH_NONE;
@@ -461,6 +547,93 @@ bool ggml_vk_peer_direct_ready(vk_buffer & src, vk_device & dst) {
     }
     std::shared_ptr<vk_peer_pair> pair = vk_peer_pair_get(src->device, dst, false);
     return pair != nullptr && pair->direct_state.load() > 0;
+}
+
+bool ggml_vk_peer_slot_acquire(vk_buffer & src, vk_buffer & dst, const void * owner, size_t size, vk_peer_slot & slot) {
+    if (size == 0 || size > vk_peer_small_max || src->device == dst->device || ggml_vk_peer_small_copy_mode() < 2 ||
+        ggml_vk_copy_mode() == 0 || vk_peer_force_staging()) {
+        return false;
+    }
+    // like the blocking copy: when both buffers are host mapped the copy on the CPU alone is less work
+    if (ggml_vk_copy_mode() != 2 && vk_peer_host_accessible(src) && vk_peer_host_accessible(dst)) {
+        return false;
+    }
+    // Only a pair whose shared staging has been verified, which the first blocking copy between them does. That
+    // verification also covers the memory of the ring, which is imported the same way.
+    std::shared_ptr<vk_peer_pair> pair = vk_peer_pair_get(src->device, dst->device, false);
+    if (!pair || pair->shared_state.load() <= 0) {
+        vk_small_unverified.fetch_add(1);
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(pair->ring_mutex);
+    if (pair->ring_failed) {
+        vk_small_ring_failed.fetch_add(1);
+        return false;
+    }
+    if (!pair->ring_src_view) {
+        bool ok = false;
+        try {
+            ok = vk_peer_ring_create(*pair);
+        } catch (const vk::SystemError & e) {
+            VK_LOG_DEBUG("vk_peer_ring_create: " << e.what());
+        }
+        if (!ok) {
+            pair->ring_failed = true;
+            return false;
+        }
+        GGML_LOG_INFO("ggml_vulkan: async small copies %s -> %s enabled (%u slots of %zu KiB)\n",
+                      pair->src->name.c_str(), pair->dst->name.c_str(), vk_peer_ring_slots, pair->ring_slot_size / 1024);
+    }
+
+    for (uint32_t k = 0; k < vk_peer_ring_slots; k++) {
+        const uint32_t i = (pair->ring_next + k) % vk_peer_ring_slots;
+        if (pair->ring_owner[i] == nullptr) {
+            pair->ring_owner[i] = owner;
+            pair->ring_next = (i + 1) % vk_peer_ring_slots;
+            slot.pair     = pair;
+            slot.src_view = pair->ring_src_view;
+            slot.dst_view = pair->ring_dst_view;
+            slot.offset   = (size_t) i * pair->ring_slot_size;
+            vk_copy_shared_bytes.fetch_add(size);
+            // the hops of a decode are many, so this shows within a few steps that the asynchronous path is used
+            const size_t n_async = vk_small_async.fetch_add(1) + 1;
+            if (n_async % 10000 == 0) {
+                GGML_LOG_INFO("ggml_vulkan: async small copies: %zu done, %zu took the blocking copy (%zu before the pair was verified, %zu ring full, %zu ring failed)\n",
+                              n_async, vk_small_unverified.load() + vk_small_ring_full.load() + vk_small_ring_failed.load(),
+                              vk_small_unverified.load(), vk_small_ring_full.load(), vk_small_ring_failed.load());
+            }
+            return true;
+        }
+    }
+    vk_small_ring_full.fetch_add(1);
+    return false;
+}
+
+void ggml_vk_peer_slot_abandon(vk_peer_slot & slot) {
+    if (slot.pair) {
+        std::lock_guard<std::mutex> lock(slot.pair->ring_mutex);
+        slot.pair->ring_owner[slot.offset / slot.pair->ring_slot_size] = nullptr;
+        slot.pair.reset();
+    }
+}
+
+void ggml_vk_peer_slots_release(ggml_backend_vk_context * ctx) {
+    std::vector<std::shared_ptr<vk_peer_pair>> pairs;
+    {
+        std::lock_guard<std::mutex> lock(ctx->device->peer_mutex);
+        for (auto & kv : ctx->device->peer_pairs) {
+            pairs.push_back(kv.second);
+        }
+    }
+    for (auto & pair : pairs) {
+        std::lock_guard<std::mutex> lock(pair->ring_mutex);
+        for (uint32_t i = 0; i < vk_peer_ring_slots; i++) {
+            if (pair->ring_owner[i] == ctx) {
+                pair->ring_owner[i] = nullptr;
+            }
+        }
+    }
 }
 
 
