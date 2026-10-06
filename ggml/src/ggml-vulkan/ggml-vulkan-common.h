@@ -59,6 +59,11 @@ void ggml_vk_buffer_memset_async(vk_context& ctx, vk_buffer& dst, size_t offset,
 void ggml_vk_buffer_memset(vk_buffer& dst, size_t offset, uint32_t c, size_t size);
 vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, size_t size);
 
+// asynchronous copy between the memory of two devices, see ggml-vulkan-peer-copy.cpp. ctx is the backend of the destination device. Returns false if the buffers are on the same device
+bool ggml_vk_peer_copy_async(ggml_backend_vk_context * ctx, vk_buffer & src, size_t src_offset, vk_buffer & dst, size_t dst_offset, size_t size);
+void ggml_vk_peer_copy_synchronize(ggml_backend_vk_context * ctx);
+void ggml_vk_peer_copy_destroy(ggml_backend_vk_context * ctx);
+
 // pipelines
 uint64_t vk_tensor_offset(const ggml_tensor * tensor);
 uint32_t get_misalign_bytes(const ggml_backend_vk_context * ctx, const ggml_tensor * t);

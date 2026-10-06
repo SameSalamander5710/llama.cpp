@@ -12841,6 +12841,8 @@ void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
 
 void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     VK_LOG_DEBUG("ggml_vk_cleanup(" << ctx->name << ")");
+    // finish the copies into this device, and stop their worker
+    ggml_vk_peer_copy_destroy(ctx);
     // discard any unsubmitted command buffers
     ctx->compute_ctx.reset();
     // wait for any pending command buffers to finish
@@ -13072,15 +13074,25 @@ ggml_backend_buffer_type_t ggml_backend_vk_buffer_type(size_t dev_num) {
     return &dev->buffer_type;
 }
 
-static const char * ggml_backend_vk_host_buffer_type_name(ggml_backend_buffer_type_t buft) {
-    return GGML_VK_NAME "_Host";
+static int ggml_backend_vk_host_buffer_type_device(ggml_backend_buffer_type_t buft) {
+    return (int) static_cast<const ggml_backend_vk_device_context *>(buft->device->context)->device;
+}
 
-    UNUSED(buft);
+static const char * ggml_backend_vk_host_buffer_type_name(ggml_backend_buffer_type_t buft) {
+    static std::vector<std::string> names = [] {
+        std::vector<std::string> names(ggml_backend_vk_get_device_count());
+        for (int i = 0; i < (int) names.size(); i++) {
+            names[i] = i == 0 ? GGML_VK_NAME "_Host" : GGML_VK_NAME + std::to_string(i) + "_Host";
+        }
+        return names;
+    }();
+
+    return names[ggml_backend_vk_host_buffer_type_device(buft)].c_str();
 }
 
 static void ggml_backend_vk_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     VK_LOG_MEMORY("ggml_backend_vk_host_buffer_free_buffer()");
-    ggml_vk_host_free(vk_instance.devices[0], buffer->context);
+    ggml_vk_host_free(vk_instance.devices[ggml_backend_vk_host_buffer_type_device(buffer->buft)], buffer->context);
 }
 
 static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
@@ -13089,7 +13101,7 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
     size += 32;  // Behave like the CPU buffer type
     void * ptr = nullptr;
     try {
-        ptr = ggml_vk_host_malloc(vk_instance.devices[0], size);
+        ptr = ggml_vk_host_malloc(vk_instance.devices[ggml_backend_vk_host_buffer_type_device(buft)], size);
     } catch (vk::SystemError& e) {
         GGML_LOG_WARN("ggml_vulkan: Failed to allocate pinned memory (%s)\n", e.what());
         // fallback to cpu buffer
@@ -13101,43 +13113,50 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
     buffer->iface.free_buffer = ggml_backend_vk_host_buffer_free_buffer;
 
     return buffer;
-
-    UNUSED(buft);
 }
 
 static size_t ggml_backend_vk_host_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
-    return vk_instance.devices[0]->properties.limits.minMemoryMapAlignment;
-
-    UNUSED(buft);
+    return vk_instance.devices[ggml_backend_vk_host_buffer_type_device(buft)]->properties.limits.minMemoryMapAlignment;
 }
 
 static size_t ggml_backend_vk_host_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
-    return vk_instance.devices[0]->suballocation_block_size;
-
-    UNUSED(buft);
+    return vk_instance.devices[ggml_backend_vk_host_buffer_type_device(buft)]->suballocation_block_size;
 }
 
+static ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type_for_device(int device) {
+    // the vector is never resized after this, so the returned pointers stay valid
+    static std::vector<ggml_backend_buffer_type> buffer_types_host = [] {
+        std::vector<ggml_backend_buffer_type> bufts(ggml_backend_vk_get_device_count());
+        for (size_t i = 0; i < bufts.size(); i++) {
+            bufts[i] = {
+                /* .iface    = */ {
+                    /* .get_name            = */ ggml_backend_vk_host_buffer_type_name,
+                    /* .alloc_buffer        = */ ggml_backend_vk_host_buffer_type_alloc_buffer,
+                    /* .alloc_buffer_n      = */ nullptr,
+                    /* .get_alignment       = */ ggml_backend_vk_host_buffer_type_get_alignment,
+                    /* .get_max_size        = */ ggml_backend_vk_host_buffer_type_get_max_size,
+                    /* .get_alloc_size      = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
+                    /* .get_alloc_size_n    = */ nullptr,
+                    /* .is_host             = */ ggml_backend_cpu_buffer_type()->iface.is_host,
+                },
+                /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), i),
+                /* .context  = */ nullptr,
+            };
+        }
+        return bufts;
+    }();
+
+    GGML_ASSERT(device >= 0 && device < (int) buffer_types_host.size());
+
+    // the interface reads vk_instance.devices[device], so the device must exist
+    ggml_vk_get_device(device);
+
+    return &buffer_types_host[device];
+}
+
+// TODO: no callers in this tree, kept so the public API does not break
 ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type() {
-    static struct ggml_backend_buffer_type ggml_backend_vk_buffer_type_host = {
-        /* .iface    = */ {
-            /* .get_name            = */ ggml_backend_vk_host_buffer_type_name,
-            /* .alloc_buffer        = */ ggml_backend_vk_host_buffer_type_alloc_buffer,
-            /* .alloc_buffer_n      = */ nullptr,
-            /* .get_alignment       = */ ggml_backend_vk_host_buffer_type_get_alignment,
-            /* .get_max_size        = */ ggml_backend_vk_host_buffer_type_get_max_size,
-            /* .get_alloc_size      = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
-            /* .get_alloc_size_n    = */ NULL,
-            /* .is_host             = */ ggml_backend_cpu_buffer_type()->iface.is_host,
-        },
-        /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), 0),
-        /* .context  = */ nullptr,
-    };
-
-    // Make sure device 0 is initialized
-    ggml_vk_instance_init();
-    ggml_vk_get_device(0);
-
-    return &ggml_backend_vk_buffer_type_host;
+    return ggml_backend_vk_host_buffer_type_for_device(0);
 }
 
 static const char * ggml_backend_vk_name(ggml_backend_t backend) {
@@ -13166,7 +13185,7 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
                                                 size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     VK_LOG_DEBUG("ggml_backend_vk_set_tensor_2d_async(" << size << ", " << n_copies << ")");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
-    GGML_ASSERT((tensor->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || tensor->buffer->buft == ggml_backend_vk_host_buffer_type()) && "unsupported buffer type");
+    GGML_ASSERT((tensor->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || tensor->buffer->buft == ggml_backend_vk_host_buffer_type_for_device((int) ctx->device->idx)) && "unsupported buffer type");
 
     if (size == 0) {
         return;
@@ -13229,7 +13248,7 @@ static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const gg
                                                 size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     VK_LOG_DEBUG("ggml_backend_vk_get_tensor_2d_async(" << size << ", " << n_copies << ")");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
-    GGML_ASSERT((tensor->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || tensor->buffer->buft == ggml_backend_vk_host_buffer_type()) && "unsupported buffer type");
+    GGML_ASSERT((tensor->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || tensor->buffer->buft == ggml_backend_vk_host_buffer_type_for_device((int) ctx->device->idx)) && "unsupported buffer type");
 
     if (size == 0) {
         return;
@@ -13423,9 +13442,49 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
     }
 }
 
+// copies a tensor from the memory of another Vulkan device without blocking, see ggml-backend-impl.h. The copy is made by a worker thread with resources of its own, since the blocking copy between devices cannot run while the backends have work in flight
+static bool ggml_backend_vk_peer_copy_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+    VK_LOG_DEBUG("ggml_backend_vk_peer_copy_async(" << src << " -> " << dst << ", size=" << ggml_nbytes(src) << ")");
+    GGML_UNUSED(backend_src);
+
+    ggml_backend_buffer_t src_buffer = src->view_src ? src->view_src->buffer : src->buffer;
+    ggml_backend_buffer_t dst_buffer = dst->view_src ? dst->view_src->buffer : dst->buffer;
+    if (src_buffer == nullptr || dst_buffer == nullptr || !ggml_backend_buffer_is_vk(src_buffer) || !ggml_backend_buffer_is_vk(dst_buffer)) {
+        return false;
+    }
+    if (!ggml_are_same_layout(src, dst)) {
+        return false;
+    }
+    if (ggml_nbytes(src) == 0) {
+        return true;
+    }
+
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend_dst->context;
+    ggml_backend_vk_buffer_context * src_buf_ctx = (ggml_backend_vk_buffer_context *)src_buffer->context;
+    ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst_buffer->context;
+
+    // the copy has to land on the device of the backend that waits for it
+    if (dst_buf_ctx->dev_buffer->device != ctx->device) {
+        return false;
+    }
+
+    return ggml_vk_peer_copy_async(ctx,
+        src_buf_ctx->dev_buffer, vk_tensor_offset(src) + src->view_offs,
+        dst_buf_ctx->dev_buffer, vk_tensor_offset(dst) + dst->view_offs,
+        ggml_nbytes(src));
+}
+
+static void ggml_backend_vk_peer_copy_synchronize(ggml_backend_t backend_dst) {
+    VK_LOG_DEBUG("ggml_backend_vk_peer_copy_synchronize()");
+    ggml_vk_peer_copy_synchronize((ggml_backend_vk_context *)backend_dst->context);
+}
+
 static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
     VK_LOG_DEBUG("ggml_backend_vk_synchronize()");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+
+    // copies from other devices that are still running write to the memory of this backend
+    ggml_vk_peer_copy_synchronize(ctx);
 
     ggml_vk_synchronize(ctx);
 
@@ -15281,8 +15340,9 @@ static ggml_backend_buffer_type_t ggml_backend_vk_device_get_buffer_type(ggml_ba
 }
 
 static ggml_backend_buffer_type_t ggml_backend_vk_device_get_host_buffer_type(ggml_backend_dev_t dev) {
-    UNUSED(dev);
-    return ggml_backend_vk_host_buffer_type();
+    ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *) dev->context;
+
+    return ggml_backend_vk_host_buffer_type_for_device((int) ctx->device);
 }
 
 static enum ggml_backend_dev_type ggml_backend_vk_device_get_type(ggml_backend_dev_t dev) {
@@ -16150,11 +16210,22 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_peer_copy_async") == 0) {
+        return (void *) ggml_backend_vk_peer_copy_async;
+    }
+    if (strcmp(name, "ggml_backend_peer_copy_synchronize") == 0) {
+        return (void *) ggml_backend_vk_peer_copy_synchronize;
+    }
+    return NULL;
+}
+
 static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_name         = */ ggml_backend_vk_reg_get_name,
     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
     /* .get_device       = */ ggml_backend_vk_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_vk_reg_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_vk_reg() {
