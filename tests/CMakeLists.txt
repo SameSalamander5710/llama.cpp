@@ -347,6 +347,14 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     llama_build_and_test(test-alloc.cpp)
 endif()
 
+# decode-shaped mat-vec benchmark that defeats the GPU cache, only needs ggml
+add_executable(bench-mul-mat-stream bench-mul-mat-stream.cpp)
+target_link_libraries(bench-mul-mat-stream PRIVATE ggml)
+target_compile_features(bench-mul-mat-stream PRIVATE cxx_std_17)
+if (LLAMA_TESTS_INSTALL)
+    install(TARGETS bench-mul-mat-stream RUNTIME)
+endif()
+
 llama_build(test-export-graph-ops.cpp)
 if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
