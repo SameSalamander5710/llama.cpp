@@ -2660,10 +2660,13 @@ llm_graph_cb llama_context::graph_get_cb() const {
 
         // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
         // - force the last op of the layer on the specified backend to avoid running it on the backend of the next layer due to scheduling
+        // - the same goes for the residual add that ends the layer ("l_out"). When the weights of the FFN sit on another
+        //   device, that add is otherwise expanded onto the device of the FFN, which then needs the residual stream
+        //   as a second input and has to send the layer output back: 3 copies between the devices per layer instead of 2
         // FIXME: fix in ggml_backend_sched
         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer_all;
         if (ubatch.n_tokens < 32 || full_offload) {
-            if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0)) {
+            if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0 || strcmp(name, "l_out") == 0)) {
                 const auto & dev_layer = model.dev_layer(il);
                 for (const auto & backend : backends) {
                     if (ggml_backend_get_device(backend.get()) == dev_layer) {
