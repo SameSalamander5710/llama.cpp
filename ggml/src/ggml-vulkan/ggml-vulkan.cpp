@@ -1688,6 +1688,102 @@ static bool ggml_vk_fa_scalar_uses_mmq(const vk_device& device, ggml_type k_type
 #endif
 }
 
+// ---- Q6_K decode on AMD, and the knobs to measure it ----------------------------------------------
+// Policy: on RDNA2 the integer dot product mat-vec (Q8_1 activations) is faster than the float one from 3 columns,
+// with 2 rows per workgroup. Measured on an RX 6700 XT, Q6_K, 17408 x 5120 FFN shapes, weights streamed from
+// memory: n=3 +16%, n=4 +61%, n=5..8 about 2x, but n=1 -7% and n=2 -14%. Columns are the tokens of one batch, so
+// n=3 is a target token plus two MTP drafts. Other architectures keep the stock behaviour.
+//
+// Environment variables, all optional. The ones about launch geometry only act on RDNA2 devices, so a mixed
+// RDNA2 + RDNA4 system keeps the stock behaviour on the RDNA4 card.
+//   GGML_VK_Q6K_MMVQ=0               stock behaviour: no integer dot mat-vec for Q6_K (to compare against the policy)
+//   GGML_VK_Q6K_MMVQ=rdna2           force the integer dot mat-vec for Q6_K on the listed architectures for any n
+//                                    (gcn, rdna1..rdna4, amd/all)
+//   GGML_VK_Q6K_MMVQ_MIN_N=N         smallest n that uses it, default 3 (RDNA2)
+//   GGML_VK_Q6K_RM_INT=N             rows per workgroup of the integer dot Q6_K mat-vec, default 2 (RDNA2)
+//   GGML_VK_DMMV_SUBGROUP_SIZE=32    required subgroup size of the mat-vec pipelines (RDNA2 only), default: the driver's
+//   GGML_VK_DMMV_RM_KQ=N             rows per workgroup of the float K-quant mat-vec (RDNA2 only)
+//   GGML_VK_DMMV_RM_KQ_INT=N         rows per workgroup of the integer dot K-quant mat-vec except Q6_K (RDNA2 only)
+static const char * ggml_vk_amd_arch_name(const vk_device & device) {
+    if (device->vendor_id != VK_VENDOR_ID_AMD) {
+        return nullptr;
+    }
+    switch (device->architecture) {
+        case AMD_GCN:   return "gcn";
+        case AMD_RDNA1: return "rdna1";
+        case AMD_RDNA2: return "rdna2";
+        case AMD_RDNA3: return "rdna3";
+        case AMD_RDNA4: return "rdna4";
+        default:        return nullptr;
+    }
+}
+
+// true if the architecture of `device` is in the comma separated list in the environment variable `name`
+static bool ggml_vk_env_arch_match(const char * name, const vk_device & device) {
+    const char * env = getenv(name);
+    const char * arch = ggml_vk_amd_arch_name(device);
+    if (env == nullptr || arch == nullptr) {
+        return false;
+    }
+    std::string list = env;
+    for (char & c : list) {
+        c = (c == ';' || c == ' ') ? ',' : (char) tolower((unsigned char) c);
+    }
+    size_t pos = 0;
+    while (pos <= list.size()) {
+        size_t end = list.find(',', pos);
+        if (end == std::string::npos) {
+            end = list.size();
+        }
+        const std::string tok = list.substr(pos, end - pos);
+        if (tok == "1" || tok == "all" || tok == "amd" || tok == arch) {
+            return true;
+        }
+        pos = end + 1;
+    }
+    return false;
+}
+
+// value of an unsigned integer environment variable, `def` if it is unset or not in [lo, hi]
+static uint32_t ggml_vk_env_uint(const char * name, uint32_t def, uint32_t lo, uint32_t hi) {
+    const char * env = getenv(name);
+    if (env == nullptr || env[0] == '\0') {
+        return def;
+    }
+    char * end = nullptr;
+    const unsigned long v = strtoul(env, &end, 10);
+    if (end == env || *end != '\0' || v < lo || v > hi) {
+        GGML_LOG_WARN("ggml_vulkan: ignoring %s=%s (expected an integer in [%u, %u])\n", name, env, lo, hi);
+        return def;
+    }
+    return (uint32_t) v;
+}
+
+// smallest n for which Q6_K uses the integer dot mat-vec on `device`, 0 if never. Depends on the device and the
+// environment only, so it can be called before the device is fully set up.
+static uint32_t ggml_vk_q6k_mmvq_min_n(const vk_device & device) {
+    if (device->vendor_id != VK_VENDOR_ID_AMD) {
+        return 0;
+    }
+    uint32_t min_n = device->architecture == AMD_RDNA2 ? 3 : 0;
+    if (const char * env = getenv("GGML_VK_Q6K_MMVQ")) {
+        std::string v = env;
+        for (char & c : v) {
+            c = (char) tolower((unsigned char) c);
+        }
+        if (v == "0" || v == "off" || v == "none" || v == "stock" || v == "false") {
+            return 0;
+        }
+        if (ggml_vk_env_arch_match("GGML_VK_Q6K_MMVQ", device)) {
+            min_n = 1;
+        }
+    }
+    if (min_n != 0) {
+        min_n = ggml_vk_env_uint("GGML_VK_Q6K_MMVQ_MIN_N", min_n, 1, 8);
+    }
+    return min_n;
+}
+
 void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
 
@@ -2893,11 +2989,56 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         rm_stdq = 2;
         rm_stdq_int = 2;
     }
-    // RDNA3/4: above four columns, static 4 rows for all types bench faster than the default
+// RDNA3/4: above four columns, static 4 rows for all types bench faster than the default
     const bool is_rdna3_or_4 = device->vendor_id == VK_VENDOR_ID_AMD && (device->architecture == AMD_RDNA3 || device->architecture == AMD_RDNA4);
     auto const &rm_int_n = [&](uint32_t rows, uint32_t i) { return (is_rdna3_or_4 && i >= 4) ? 4u : rows; };
     // RDNA3/4: Static 4 rows for all types bench faster than the default
     auto const &rm_id = [&](uint32_t rows) { return is_rdna3_or_4 ? 4u : rows; };
+
+    // RDNA2 Q5_K: 1 row at n=1, 2 rows at n=4, 4 rows at other n; GGML_VK_DMMV_RM_KQ_INT overrides
+    const bool is_rdna2 = device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA2;
+    const bool rm_q5k_env = is_rdna2 && getenv("GGML_VK_DMMV_RM_KQ_INT") != nullptr;
+    auto const &rm_q5k_int = [&](uint32_t i) {
+        return is_rdna2 && !rm_q5k_env ? (i == 0 ? 1u : (i == 3 ? 2u : 4u)) : rm_kq_int;
+    };
+
+    // RDNA2 tuning, see the comment above ggml_vk_amd_arch_name
+    uint32_t rm_q6k_int = rm_kq_int; // rows of the integer dot Q6_K mat-vec
+    uint32_t dmmv_subgroup_override = 0;
+    if (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA2) {
+        rm_kq     = ggml_vk_env_uint("GGML_VK_DMMV_RM_KQ",     rm_kq,     1, 8);
+        rm_kq_int = ggml_vk_env_uint("GGML_VK_DMMV_RM_KQ_INT", rm_kq_int, 1, 8);
+        rm_q6k_int = ggml_vk_env_uint("GGML_VK_Q6K_RM_INT", 2, 1, 8);
+        const uint32_t sg = ggml_vk_env_uint("GGML_VK_DMMV_SUBGROUP_SIZE", 0, 8, 128);
+        if (sg != 0) {
+            if (device->subgroup_size_control && device->subgroup_min_size <= sg && sg <= device->subgroup_max_size) {
+                dmmv_subgroup_override = sg;
+            } else {
+                GGML_LOG_WARN("ggml_vulkan: %s: ignoring GGML_VK_DMMV_SUBGROUP_SIZE=%u, the device supports %u..%u%s\n",
+                              device->name.c_str(), sg, device->subgroup_min_size, device->subgroup_max_size,
+                              device->subgroup_size_control ? "" : " (no subgroup size control)");
+            }
+        }
+        if (!requested) {
+            const uint32_t q6_min_n = ggml_vk_q6k_mmvq_min_n(device);
+            char q6_desc[64];
+            if (q6_min_n == 0) {
+                snprintf(q6_desc, sizeof(q6_desc), "off (stock)");
+            } else {
+                snprintf(q6_desc, sizeof(q6_desc), "n >= %u, rows %u", q6_min_n, rm_q6k_int);
+            }
+            char q5_desc[64];
+            if (is_rdna2 && !rm_q5k_env) {
+                snprintf(q5_desc, sizeof(q5_desc), "n 1:1, 4:2, else 4");
+            } else {
+                snprintf(q5_desc, sizeof(q5_desc), "rm_kq_int %u", rm_kq_int);
+            }
+            GGML_LOG_INFO("ggml_vulkan: %s: RDNA2 mat-vec: subgroup %u%s, rm_kq %u, rm_kq_int %u, Q5_K rows %s, Q6_K int dot: %s\n",
+                          device->name.c_str(),
+                          dmmv_subgroup_override ? dmmv_subgroup_override : device->subgroup_size,
+                          dmmv_subgroup_override ? " (forced)" : "", rm_kq, rm_kq_int, q5_desc, q6_desc);
+        }
+    }
     uint32_t rm_iq = 2 * rm_kq;
 
     const bool use_subgroups = device->subgroup_arithmetic;
@@ -2908,7 +3049,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // Ensure a subgroup size >= 16 is available
     const bool use_subgroups16 = use_subgroups && subgroup_min_size_16 && !is_imagination_proprietary;
 
-    const uint32_t subgroup_size = (device->vendor_id == VK_VENDOR_ID_INTEL && device->subgroup_size_control && device->subgroup_min_size <= 16 && device->subgroup_max_size >= 16) ? 16 : device->subgroup_size;
+    const uint32_t subgroup_size = dmmv_subgroup_override ? dmmv_subgroup_override :
+        (device->vendor_id == VK_VENDOR_ID_INTEL && device->subgroup_size_control && device->subgroup_min_size <= 16 && device->subgroup_max_size >= 16) ? 16 : device->subgroup_size;
     const uint32_t subgroup_size16 = std::max(subgroup_size, 16u);
 
     const uint32_t force_subgroup_size = use_subgroups ? subgroup_size : 0;
@@ -2997,7 +3139,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
             if (device->integer_dot_product) {
-                const uint32_t subgroup_size_int = (device->vendor_id == VK_VENDOR_ID_INTEL && device->subgroup_size_control) ? device->subgroup_min_size : device->subgroup_size;
+                const uint32_t subgroup_size_int = dmmv_subgroup_override ? dmmv_subgroup_override :
+                    (device->vendor_id == VK_VENDOR_ID_INTEL && device->subgroup_size_control) ? device->subgroup_min_size : device->subgroup_size;
                 const uint32_t wg_size_subgroup_int = (w == DMMV_WG_SIZE_SUBGROUP) ? subgroup_size_int : (subgroup_size_int * 4);
 
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q2_0][i], "mul_mat_vec_q2_0_q8_1_f32", arr_dmmv_q2_0_q8_1_f32_len[reduc], arr_dmmv_q2_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(2*rm_kq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(2*rm_kq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
@@ -3012,8 +3155,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q2_K][i], "mul_mat_vec_q2_k_q8_1_f32", arr_dmmv_q2_k_q8_1_f32_len[reduc], arr_dmmv_q2_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(2*rm_kq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(2*rm_kq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q3_K][i], "mul_mat_vec_q3_k_q8_1_f32", arr_dmmv_q3_k_q8_1_f32_len[reduc], arr_dmmv_q3_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(1*rm_kq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(1*rm_kq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_K][i], "mul_mat_vec_q4_k_q8_1_f32", arr_dmmv_q4_k_q8_1_f32_len[reduc], arr_dmmv_q4_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(1*rm_kq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(1*rm_kq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
-                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q5_K][i], "mul_mat_vec_q5_k_q8_1_f32", arr_dmmv_q5_k_q8_1_f32_len[reduc], arr_dmmv_q5_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(1*rm_kq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(1*rm_kq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
-                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q6_K][i], "mul_mat_vec_q6_k_q8_1_f32", arr_dmmv_q6_k_q8_1_f32_len[reduc], arr_dmmv_q6_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(1*rm_kq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(1*rm_kq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q5_K][i], "mul_mat_vec_q5_k_q8_1_f32", arr_dmmv_q5_k_q8_1_f32_len[reduc], arr_dmmv_q5_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(rm_q5k_int(i), i), 1, 1}, {wg_size_subgroup_int, rm_int_n(rm_q5k_int(i), i), i+1}, 1, true, use_subgroups, subgroup_size_int);
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q6_K][i], "mul_mat_vec_q6_k_q8_1_f32", arr_dmmv_q6_k_q8_1_f32_len[reduc], arr_dmmv_q6_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(1*rm_q6k_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(1*rm_q6k_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
 
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_IQ1_S][i], "mul_mat_vec_iq1_s_q8_1_f32", arr_dmmv_iq1_s_q8_1_f32_len[reduc], arr_dmmv_iq1_s_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_iq_int(i), 1, 1}, {wg_size_subgroup_int, 1*rm_iq_int(i), i+1}, 1, true, use_subgroups, subgroup_size_int);
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_IQ1_M][i], "mul_mat_vec_iq1_m_q8_1_f32", arr_dmmv_iq1_m_q8_1_f32_len[reduc], arr_dmmv_iq1_m_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_iq_int(i), 1, 1}, {wg_size_subgroup_int, 1*rm_iq_int(i), i+1}, 1, true, use_subgroups, subgroup_size_int);
@@ -4925,6 +5068,7 @@ vk_device ggml_vk_get_device(size_t idx) {
         } else if (getenv("GGML_VK_FORCE_MMVQ")) {
             device->mmvq_mode = 1;
         }
+        device->q6k_mmvq_min_n = ggml_vk_q6k_mmvq_min_n(device);
 
         return device;
     }
@@ -6563,9 +6707,9 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
     }
 
     // q6_k only has 2-byte alignment which makes it somewhat problematic,
-    // using MMVQ is only a win on Intel.
-    bool mmvq_q6 = device->vendor_id == VK_VENDOR_ID_INTEL;
-    if (src0_type == GGML_TYPE_Q6_K && !mmvq_q6) {
+    // using MMVQ is only a win on Intel, and on RDNA2 from a few columns (ggml_vk_q6k_mmvq_min_n).
+    if (src0_type == GGML_TYPE_Q6_K && device->vendor_id != VK_VENDOR_ID_INTEL &&
+        (device->q6k_mmvq_min_n == 0 || n < device->q6k_mmvq_min_n)) {
         return false;
     }
 
@@ -16442,6 +16586,16 @@ void vk_perf_logger::print_timings(bool force) {
                       << " GFLOPS/s)";
         }
 
+        // mat-vec nodes also report the weight bytes streamed per second, to compare against the memory bandwidth
+        auto wit = wbytes.find(t.first);
+        if (wit != wbytes.end() && (wit->second).size() == t.second.size()) {
+            uint64_t total_op_wbytes = 0;
+            for (const auto & elem : wit->second) {
+                total_op_wbytes += elem;
+            }
+            std::cerr << " (" << double(total_op_wbytes) / double(total_op_times) << " GB/s weights)";
+        }
+
         total_all_op_times += total_op_times;
 
         std::cerr << std::endl;
@@ -16453,6 +16607,7 @@ void vk_perf_logger::print_timings(bool force) {
 
     timings.clear();
     flops.clear();
+    wbytes.clear();
 }
 
 std::string vk_perf_logger::get_node_fusion_name(const ggml_tensor * node, const char *fusion_name, uint64_t *n_flops) {
