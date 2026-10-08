@@ -1417,7 +1417,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    const bool prefetch = llama_context_should_prefetch(cparams, ubatch.n_tokens);
+
+    if (!graph_reuse_disable && gf_res_prev_active == res && gf_res_prev_prefetch == prefetch && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1436,7 +1438,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
         // stage weights that are not resident on the compute device into device memory, for real prefill-sized ubatches
-        ggml_backend_sched_set_prefetch(sched.get(), llama_context_should_prefetch(cparams, ubatch.n_tokens));
+        ggml_backend_sched_set_prefetch(sched.get(), prefetch);
 
         //const auto t_start_us = ggml_time_us();
 
@@ -1456,7 +1458,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        gf_res_prev_active = res;
+        gf_res_prev_active   = res;
+        gf_res_prev_prefetch = prefetch;
     }
 
     // set the input data for the input tensors
@@ -1468,9 +1471,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
-
-    // the graph was built under this prefetch state; graph reuse requires equal n_tokens
-    GGML_ASSERT(ggml_backend_sched_get_prefetch(sched.get()) == llama_context_should_prefetch(cparams, ubatch.n_tokens));
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
@@ -2660,10 +2660,13 @@ llm_graph_cb llama_context::graph_get_cb() const {
 
         // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
         // - force the last op of the layer on the specified backend to avoid running it on the backend of the next layer due to scheduling
+        // - the same goes for the residual add that ends the layer ("l_out"). When the weights of the FFN sit on another
+        //   device, that add is otherwise expanded onto the device of the FFN, which then needs the residual stream
+        //   as a second input and has to send the layer output back: 3 copies between the devices per layer instead of 2
         // FIXME: fix in ggml_backend_sched
         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer_all;
         if (ubatch.n_tokens < 32 || full_offload) {
-            if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0)) {
+            if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0 || strcmp(name, "l_out") == 0)) {
                 const auto & dev_layer = model.dev_layer(il);
                 for (const auto & backend : backends) {
                     if (ggml_backend_get_device(backend.get()) == dev_layer) {

@@ -4249,6 +4249,12 @@ vk_device ggml_vk_get_device(size_t idx) {
                 device->memory_priority = true;
             } else if (strcmp("VK_EXT_external_memory_host", properties.extensionName) == 0) {
                 device->external_memory_host = true;
+            } else if (strcmp("VK_KHR_external_memory_fd", properties.extensionName) == 0) {
+                device->external_memory_fd = true;
+            } else if (strcmp("VK_KHR_external_memory_win32", properties.extensionName) == 0) {
+                device->external_memory_win32 = true;
+            } else if (strcmp(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME, properties.extensionName) == 0) {
+                device->external_memory_dma_buf = true;
 #if defined(VK_EXT_shader_64bit_indexing)
             } else if (strcmp("VK_EXT_shader_64bit_indexing", properties.extensionName) == 0) {
                 device->shader_64b_indexing = true;
@@ -4272,6 +4278,13 @@ vk_device ggml_vk_get_device(size_t idx) {
         vk::PhysicalDeviceSubgroupSizeControlPropertiesEXT subgroup_size_control_props;
         vk::PhysicalDeviceShaderIntegerDotProductPropertiesKHR shader_integer_dot_product_props;
         vk::PhysicalDeviceExternalMemoryHostPropertiesEXT external_memory_host_props;
+
+        // sharing memory between devices only matters when more than one is in use
+        if (vk_instance.device_indices.size() < 2) {
+            device->external_memory_fd = false;
+            device->external_memory_win32 = false;
+            device->external_memory_dma_buf = false;
+        }
 
         props2.pNext = &props3;
         props3.pNext = &subgroup_props;
@@ -4601,6 +4614,16 @@ vk_device ggml_vk_get_device(size_t idx) {
             device_extensions.push_back("VK_EXT_external_memory_host");
         }
 
+        if (device->external_memory_fd) {
+            device_extensions.push_back("VK_KHR_external_memory_fd");
+            if (device->external_memory_dma_buf) {
+                device_extensions.push_back("VK_EXT_external_memory_dma_buf");
+            }
+        }
+        if (device->external_memory_win32) {
+            device_extensions.push_back("VK_KHR_external_memory_win32");
+        }
+
 #if defined(VK_EXT_shader_64bit_indexing)
         VkPhysicalDeviceShader64BitIndexingFeaturesEXT shader_64bit_indexing_features {};
         shader_64bit_indexing_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_64_BIT_INDEXING_FEATURES_EXT;
@@ -4914,6 +4937,18 @@ vk_device ggml_vk_get_device(size_t idx) {
             .setPEnabledExtensionNames(device_extensions);
         device_create_info.setPNext(&device_features2);
         device->device = device->physical_device.createDevice(device_create_info);
+
+        if (device->external_memory_fd || device->external_memory_win32) {
+            device->id_props = device->physical_device.getProperties2<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceIDProperties>().get<vk::PhysicalDeviceIDProperties>();
+
+            std::vector<vk::PhysicalDevice> peers;
+            for (size_t peer_num : vk_instance.device_indices) {
+                if (peer_num != dev_num && peer_num < physical_devices.size()) {
+                    peers.push_back(physical_devices[peer_num]);
+                }
+            }
+            ggml_vk_init_direct_copy(device, peers);
+        }
 
         if (device->device_fault) {
             device->pfn_vkGetDeviceFaultInfoEXT = (PFN_vkGetDeviceFaultInfoEXT)
@@ -13182,7 +13217,8 @@ ggml_backend_buffer_t ggml_backend_vk_buffer_type_alloc_buffer(ggml_backend_buff
 
     vk_buffer dev_buffer = nullptr;
     try {
-        dev_buffer = ggml_vk_create_buffer_device(ctx->device, size);
+        // exportable, so that the other devices can copy out of it directly
+        dev_buffer = ggml_vk_create_buffer_device(ctx->device, size, true);
     } catch (const vk::SystemError& e) {
         return nullptr;
     }
@@ -13444,6 +13480,57 @@ static void ggml_backend_vk_get_tensor_async(ggml_backend_t backend, const ggml_
     ggml_backend_vk_get_tensor_2d_async(backend, tensor, data, offset, size, 1, size, size);
 }
 
+// A small tensor from another device over the shared staging memory, without the blocking copy (GGML_VK_PEER_SMALL_COPY=2).
+// Only used when there is no direct path between the devices. The blocking copy is two hops, each with its own submit
+// and fence, and the scheduler synchronizes both backends around it. Here the source device copies into a slot in
+// the command buffer that the synchronization of the source backend submits anyway, and the destination device copies
+// out of the slot in the commands of the destination backend, behind the work it already has: one fence wait in all.
+static bool ggml_vk_cpy_tensor_shared_async(ggml_backend_t backend_src, ggml_backend_vk_context * ctx_dst, const ggml_tensor * src, ggml_tensor * dst,
+                                            vk_buffer & src_buf, vk_buffer & dst_buf) {
+    if (ggml_vk_peer_small_copy_mode() < 2 || backend_src == nullptr || !ggml_backend_is_vk(backend_src)) {
+        return false;
+    }
+    // weights are for the prefetch, and the copy of an activation needs the source to be done
+    if (ggml_backend_buffer_get_usage(src->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+        return false;
+    }
+    ggml_backend_vk_context * ctx_src = (ggml_backend_vk_context *)backend_src->context;
+    if (ctx_src->device != src_buf->device) {
+        return false;
+    }
+
+    const size_t size = ggml_nbytes(src);
+    vk_peer_slot slot;
+    if (!ggml_vk_peer_slot_acquire(src_buf, dst_buf, ctx_dst, size, slot)) {
+        return false;
+    }
+
+    // source tensor -> slot. This starts a context after the graph that produced the tensor, which was submitted
+    // already, so the barrier makes the copy wait for it (a barrier covers everything earlier in the queue). The
+    // synchronization submits the context and waits for the fence, so the slot is filled when it returns.
+    vk_context src_ctx = ggml_vk_get_compute_ctx(ctx_src);
+    ggml_vk_sync_buffers(ctx_src, src_ctx);
+    ggml_vk_buffer_copy_async(src_ctx, slot.src_view, slot.offset, src_buf, vk_tensor_offset(src) + src->view_offs, size);
+    ggml_backend_synchronize(backend_src);
+
+    // slot -> destination tensor, recorded in the commands of the destination backend. The slot stays taken until
+    // that backend synchronizes (ggml_vk_synchronize), when the copy is certainly done.
+    vk_context cpy_ctx;
+    if (ctx_dst->device->async_use_transfer_queue) {
+        cpy_ctx = ggml_vk_get_transfer_ctx(ctx_dst);
+    } else {
+        cpy_ctx = ggml_vk_get_compute_ctx(ctx_dst);
+    }
+    ggml_vk_buffer_copy_async(cpy_ctx, dst_buf, vk_tensor_offset(dst) + dst->view_offs, slot.dst_view, slot.offset, size);
+    // what the destination backend records after this reads the tensor. Not on the transfer queue: a barrier with
+    // compute stages is not valid there, and the compute queue waits for the transfer context with its semaphore,
+    // like it does for the direct copy
+    if (!ctx_dst->device->async_use_transfer_queue) {
+        ggml_vk_sync_buffers(ctx_dst, cpy_ctx);
+    }
+    return true;
+}
+
 static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_backend_vk_cpy_tensor_async(" << src << " -> " << dst << ", size=" << ggml_nbytes(src) << ")");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend_dst->context;
@@ -13463,9 +13550,32 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
     if (ggml_backend_buffer_is_vk(src->buffer)) {
         ggml_backend_vk_buffer_context * src_buf_ctx = (ggml_backend_vk_buffer_context *)src->buffer->context;
 
-        // Async copy only works within the same device
+        // A buffer of another device is copied out of its own memory, without going through the host.
         if (src_buf_ctx->dev_buffer->device != dst_buf->device) {
-            return false;
+            // Only when the pair of devices has been verified to share memory. The first copy between them is a
+            // blocking one that checks it, so this falls back to that.
+            if (!ggml_vk_buffer_copy_direct_ready(src_buf_ctx->dev_buffer, dst_buf->device)) {
+                // no direct path: a small tensor can still go over shared staging without a blocking copy
+                return ggml_vk_cpy_tensor_shared_async(backend_src, ctx, src, dst, src_buf_ctx->dev_buffer, dst_buf);
+            }
+
+            // The scheduler does not wait for the source backend when the copy is asynchronous, so the data the
+            // source has produced must be complete before the copy is submitted. Weights never change once they
+            // are loaded and need no wait, which keeps the source device out of the way of a prefetch.
+            if (backend_src != nullptr && ggml_backend_buffer_get_usage(src->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                ggml_backend_synchronize(backend_src);
+            }
+
+            vk_context cpy_ctx;
+            if (ctx->device->async_use_transfer_queue) {
+                cpy_ctx = ggml_vk_get_transfer_ctx(ctx);
+            } else {
+                cpy_ctx = ggml_vk_get_compute_ctx(ctx);
+            }
+
+            return ggml_vk_buffer_copy_direct_async(cpy_ctx, dst_buf, vk_tensor_offset(dst) + dst->view_offs,
+                                                    src_buf_ctx->dev_buffer, vk_tensor_offset(src) + src->view_offs,
+                                                    ggml_nbytes(src));
         }
 
         vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
@@ -13584,6 +13694,9 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
         }
         ctx->compute_ctx.reset();
     }
+
+    // everything this backend was given has finished, including the copies out of the slots of shared staging
+    ggml_vk_peer_slots_release(ctx);
 }
 
 // copies a tensor from the memory of another Vulkan device without blocking, see ggml-backend-impl.h. The copy is made by a worker thread with resources of its own, since the blocking copy between devices cannot run while the backends have work in flight
@@ -13621,6 +13734,12 @@ static bool ggml_backend_vk_peer_copy_async(ggml_backend_t backend_src, ggml_bac
 static void ggml_backend_vk_peer_copy_synchronize(ggml_backend_t backend_dst) {
     VK_LOG_DEBUG("ggml_backend_vk_peer_copy_synchronize()");
     ggml_vk_peer_copy_synchronize((ggml_backend_vk_context *)backend_dst->context);
+}
+
+// turns the peer copy paths of the Vulkan devices on or off, see ggml-backend-impl.h
+static void ggml_backend_vk_peer_copy_set(bool enabled) {
+    VK_LOG_DEBUG("ggml_backend_vk_peer_copy_set(" << enabled << ")");
+    ggml_vk_set_peer_copy(enabled);
 }
 
 static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
@@ -16361,6 +16480,15 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     }
     if (strcmp(name, "ggml_backend_peer_copy_synchronize") == 0) {
         return (void *) ggml_backend_vk_peer_copy_synchronize;
+    }
+    if (strcmp(name, "ggml_backend_peer_copy_set") == 0) {
+        return (void *) ggml_backend_vk_peer_copy_set;
+    }
+    // void ggml_backend_vk_get_copy_stats(size_t * direct_bytes, size_t * shared_bytes, size_t * host_bytes)
+    // bytes copied between devices straight out of the memory of the other device, through memory shared by both
+    // devices without a copy on the CPU, and through host staging buffers
+    if (strcmp(name, "ggml_backend_vk_get_copy_stats") == 0) {
+        return (void *) ggml_vk_copy_stats;
     }
     return NULL;
 }

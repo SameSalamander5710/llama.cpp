@@ -1,5 +1,12 @@
 #include "ggml-vulkan-common.h"
 
+#include <atomic>
+#include <cstdlib>
+#include <mutex>
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
+
 ggml_backend_buffer_type_i ggml_backend_vk_buffer_type_interface = {
     /* .get_name            = */ ggml_backend_vk_buffer_type_name,
     /* .alloc_buffer        = */ ggml_backend_vk_buffer_type_alloc_buffer,
@@ -26,7 +33,7 @@ static std::vector<uint32_t> ggml_vk_find_memory_properties(const vk::PhysicalDe
 }
 
 static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std::initializer_list<vk::MemoryPropertyFlags> & req_flags_list,
-                                       void *import_ptr = nullptr) {
+                                       void *import_ptr = nullptr, vk::ExternalMemoryHandleTypeFlagBits export_handle_type = {}) {
     VK_LOG_DEBUG("ggml_vk_create_buffer(" << device->name << ", " << size << ", " << to_string(req_flags_list.begin()[0]) << ", " << to_string(req_flags_list.begin()[req_flags_list.size()-1]) << ")");
     if (size > device->max_buffer_size) {
         throw vk::OutOfDeviceMemoryError("Requested buffer size exceeds device buffer size limit");
@@ -55,9 +62,15 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
         nullptr,
     };
 
+    // memory that another device can import, see ggml_vk_import_buffer
+    const bool exporting = !import_ptr && export_handle_type != vk::ExternalMemoryHandleTypeFlagBits{};
+
     vk::ExternalMemoryBufferCreateInfo external_memory_bci;
     if (import_ptr) {
         external_memory_bci.handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT;
+        buffer_create_info.setPNext(&external_memory_bci);
+    } else if (exporting) {
+        external_memory_bci.handleTypes = export_handle_type;
         buffer_create_info.setPNext(&external_memory_bci);
     }
 
@@ -73,6 +86,18 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
 
     if (device->memory_priority) {
         mem_flags_info.setPNext(&mem_priority_info);
+    }
+
+    vk::ExportMemoryAllocateInfo export_info { export_handle_type };
+    vk::MemoryDedicatedAllocateInfo dedicated_info { {}, buf->buffer };
+    const void * alloc_pnext = &mem_flags_info;
+    if (exporting) {
+        export_info.setPNext(&mem_flags_info);
+        alloc_pnext = &export_info;
+        if (device->export_dedicated) {
+            dedicated_info.setPNext(&export_info);
+            alloc_pnext = &dedicated_info;
+        }
     }
 
     if (import_ptr) {
@@ -132,8 +157,11 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
 
             for (auto mtype_it = memory_type_indices.begin(); mtype_it != memory_type_indices.end(); mtype_it++) {
                 try {
-                    buf->device_memory = device->device.allocateMemory({ mem_req.size, *mtype_it, &mem_flags_info });
+                    buf->device_memory = device->device.allocateMemory({ mem_req.size, *mtype_it, alloc_pnext });
                     buf->memory_property_flags = mem_props.memoryTypes[*mtype_it].propertyFlags;
+                    buf->memory_type_index = *mtype_it;
+                    buf->alloc_size = mem_req.size;
+                    buf->export_handle_type = exporting ? export_handle_type : vk::ExternalMemoryHandleTypeFlagBits{};
                     done = true;
                     break;
                 } catch (const vk::SystemError& e) {
@@ -192,34 +220,34 @@ vk_buffer ggml_vk_create_buffer_check(vk_device& device, size_t size, vk::Memory
     }
 }
 
-vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {
+static vk_buffer ggml_vk_create_buffer_device_impl(vk_device& device, size_t size, vk::ExternalMemoryHandleTypeFlagBits export_handle_type) {
     vk_buffer buf;
     try {
         if (device->prefer_host_memory) {
             buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
-                                                       vk::MemoryPropertyFlagBits::eDeviceLocal});
+                                                       vk::MemoryPropertyFlagBits::eDeviceLocal}, nullptr, export_handle_type);
         } else if (device->uma) {
             // On UMA, prefer host-visible memory so direct tensor borrowing works.
             // If unavailable, fall back to device-local memory.
             buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
                                                        vk::MemoryPropertyFlagBits::eDeviceLocal,
-                                                       vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
+                                                       vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent}, nullptr, export_handle_type);
         } else if (device->disable_host_visible_vidmem) {
             if (device->allow_sysmem_fallback) {
                 buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal,
-                                                           vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
+                                                           vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent}, nullptr, export_handle_type);
             } else {
-                buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal});
+                buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal}, nullptr, export_handle_type);
             }
         } else {
             // use rebar if available, otherwise fallback to device only visible memory
             if (device->allow_sysmem_fallback) {
                 buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
                                                            vk::MemoryPropertyFlagBits::eDeviceLocal,
-                                                           vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
+                                                           vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent}, nullptr, export_handle_type);
             } else {
                 buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
-                                                           vk::MemoryPropertyFlagBits::eDeviceLocal});
+                                                           vk::MemoryPropertyFlagBits::eDeviceLocal}, nullptr, export_handle_type);
             }
         }
     } catch (const vk::SystemError& e) {
@@ -229,6 +257,19 @@ vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {
     }
 
     return buf;
+}
+
+vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size, bool exportable) {
+    if (exportable && device->export_handle_type != vk::ExternalMemoryHandleTypeFlagBits{}) {
+        try {
+            return ggml_vk_create_buffer_device_impl(device, size, device->export_handle_type);
+        } catch (const vk::SystemError& e) {
+            // the driver may refuse exportable memory, or be out of memory. Fall back to a plain buffer,
+            // which only loses the direct device to device copies for this buffer
+            VK_LOG_DEBUG("ggml_vk_create_buffer_device: exportable allocation failed (" << e.what() << "), retrying plain");
+        }
+    }
+    return ggml_vk_create_buffer_device_impl(device, size, {});
 }
 
 void ggml_vk_destroy_buffer(vk_buffer& buf) {
@@ -685,6 +726,353 @@ void ggml_vk_buffer_copy_async(vk_context& ctx, vk_buffer& dst, size_t dst_offse
     vkCmdCopyBuffer(ctx->s->buffer->buf, (VkBuffer)src->buffer, (VkBuffer)dst->buffer, 1, &bc);
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Exporting device buffers, and importing them into another device
+//
+// A device buffer is allocated with exportable memory when more than one device is in use and some other device can
+// import it. The device that wants the data imports the memory of the source buffer and pulls from it with a copy
+// command on its own queue, so the data never lands in host memory. How the copies between two devices are chosen,
+// verified and run is in ggml-vulkan-peer-copy.cpp.
+//
+// GGML_VK_DIRECT_COPY selects what is allowed:
+//   0        host staging only, like before
+//   1        direct, then shared staging, then host staging (default)
+//   2        shared staging, then host staging
+//   3        like 1, and also tries opaque handles between different physical devices. The Vulkan specification only
+//            guarantees those to work within one physical device, but some drivers accept them. Verified like the rest.
+// The tools set the mode at run time, which is what --peer-to-peer does, and the environment overrides that.
+// ---------------------------------------------------------------------------------------------------------------------
+
+static std::atomic<int> ggml_vk_copy_mode_flag{ -1 };
+
+void ggml_vk_set_peer_copy(bool enabled) {
+    ggml_vk_copy_mode_flag.store(enabled ? 1 : 0);
+}
+
+int ggml_vk_copy_mode() {
+    static const int env_mode = []() {
+        const char * env = getenv("GGML_VK_DIRECT_COPY");
+        return env ? atoi(env) : -1;
+    }();
+    int mode = env_mode >= 0 ? env_mode : ggml_vk_copy_mode_flag.load();
+    if (mode < 0) {
+        mode = 1;
+    }
+    return mode >= 0 && mode <= 3 ? mode : 1;
+}
+
+// The opaque handle of the platform, the one that exists on every driver that can share memory at all
+#if defined(_WIN32)
+static constexpr vk::ExternalMemoryHandleTypeFlagBits vk_opaque_handle_type = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueWin32;
+#else
+static constexpr vk::ExternalMemoryHandleTypeFlagBits vk_opaque_handle_type = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd;
+#endif
+
+const char * ggml_vk_handle_type_name(vk::ExternalMemoryHandleTypeFlagBits type) {
+    switch (type) {
+        case vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT:   return "DMA_BUF";
+        case vk::ExternalMemoryHandleTypeFlagBits::eOpaqueWin32: return "OPAQUE_WIN32";
+        default:                                                 return "OPAQUE_FD";
+    }
+}
+
+// A native handle of the memory of a buffer, a file descriptor on Linux and an NT handle on Windows.
+// A file descriptor belongs to the driver once the memory is imported. An NT handle never does, importing it makes
+// the driver take its own reference, and the handle has to be closed here either way.
+class vk_native_handle {
+public:
+#if defined(_WIN32)
+    typedef HANDLE type;
+    static type none() { return nullptr; }
+#else
+    typedef int type;
+    static type none() { return -1; }
+#endif
+
+    vk_native_handle() = default;
+    explicit vk_native_handle(type h) : handle(h) {}
+    vk_native_handle(const vk_native_handle &) = delete;
+    vk_native_handle & operator=(const vk_native_handle &) = delete;
+    ~vk_native_handle() {
+        if (handle != none()) {
+#if defined(_WIN32)
+            CloseHandle(handle);
+#else
+            close(handle);
+#endif
+        }
+    }
+
+    type get() const { return handle; }
+
+    // the import succeeded
+    void imported() {
+#if !defined(_WIN32)
+        handle = none();
+#endif
+    }
+
+private:
+    type handle = none();
+};
+
+static vk_native_handle ggml_vk_export_native_handle(vk_device & device, vk::DeviceMemory memory, vk::ExternalMemoryHandleTypeFlagBits type) {
+#if defined(_WIN32)
+    return vk_native_handle(device->device.getMemoryWin32HandleKHR({ memory, type }));
+#else
+    return vk_native_handle(device->device.getMemoryFdKHR({ memory, type }));
+#endif
+}
+
+static vk::DeviceMemory ggml_vk_import_native_handle(vk_device & device, vk::DeviceSize size, uint32_t memory_type_index,
+                                                     vk::ExternalMemoryHandleTypeFlagBits type, const vk_native_handle & handle,
+                                                     const vk::MemoryDedicatedAllocateInfo * dedicated) {
+#if defined(_WIN32)
+    vk::ImportMemoryWin32HandleInfoKHR import_info { type, handle.get() };
+#else
+    vk::ImportMemoryFdInfoKHR import_info { type, handle.get() };
+#endif
+    if (dedicated) {
+        import_info.setPNext(dedicated);
+    }
+    return device->device.allocateMemory({ size, memory_type_index, &import_info });
+}
+
+static vk::ExternalMemoryProperties ggml_vk_external_buffer_props(vk::PhysicalDevice pd, vk::BufferUsageFlags usage, vk::ExternalMemoryHandleTypeFlagBits type) {
+    const vk::PhysicalDeviceExternalBufferInfo info { {}, usage, type };
+    return pd.getExternalBufferProperties(info).externalMemoryProperties;
+}
+
+bool ggml_vk_same_physical_device(const vk::PhysicalDeviceIDProperties & a, const vk::PhysicalDeviceIDProperties & b) {
+    return std::equal(std::begin(a.deviceUUID), std::end(a.deviceUUID), std::begin(b.deviceUUID)) &&
+           std::equal(std::begin(a.driverUUID), std::end(a.driverUUID), std::begin(b.driverUUID));
+}
+
+static bool ggml_vk_has_extension(vk::PhysicalDevice pd, const char * name) {
+    for (const auto & ext : pd.enumerateDeviceExtensionProperties()) {
+        if (strcmp(ext.extensionName, name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ggml_vk_can_import_from(vk::PhysicalDevice pd, const vk::PhysicalDeviceIDProperties & pd_id, const vk_device & exporter,
+                             vk::ExternalMemoryHandleTypeFlagBits type, bool exporter_dedicated) {
+#if defined(_WIN32)
+    if (!ggml_vk_has_extension(pd, "VK_KHR_external_memory_win32")) {
+        return false;
+    }
+#else
+    if (!ggml_vk_has_extension(pd, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME)) {
+        return false;
+    }
+    if (type == vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT && !ggml_vk_has_extension(pd, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME)) {
+        return false;
+    }
+#endif
+    // an opaque handle is only guaranteed to work within one physical device
+    if (type == vk_opaque_handle_type && ggml_vk_copy_mode() != 3 && !ggml_vk_same_physical_device(exporter->id_props, pd_id)) {
+        return false;
+    }
+    const vk::ExternalMemoryProperties props = ggml_vk_external_buffer_props(pd, vk::BufferUsageFlagBits::eTransferSrc, type);
+    if (!(props.externalMemoryFeatures & vk::ExternalMemoryFeatureFlagBits::eImportable)) {
+        return false;
+    }
+    // memory exported as a dedicated allocation has to be imported as one too, which is what the importer does.
+    // But memory that is not dedicated cannot be imported by a device that only imports dedicated memory
+    if ((props.externalMemoryFeatures & vk::ExternalMemoryFeatureFlagBits::eDedicatedOnly) && !exporter_dedicated) {
+        return false;
+    }
+    return true;
+}
+
+// Picks the handle type the buffers of a device are exported with, so that one of the other devices in use can
+// import them. Leaves device->export_handle_type empty when there is none, which keeps allocations as they were.
+void ggml_vk_init_direct_copy(vk_device& device, const std::vector<vk::PhysicalDevice> & peers) {
+    device->export_handle_type = {};
+    device->export_dedicated = false;
+
+    const int mode = ggml_vk_copy_mode();
+    if (mode == 0 || mode == 2) {
+        return;
+    }
+#if defined(_WIN32)
+    if (!device->external_memory_win32) {
+        return;
+    }
+#else
+    if (!device->external_memory_fd) {
+        return;
+    }
+#endif
+
+    vk::BufferUsageFlags usage = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst;
+    if (device->buffer_device_address) {
+        usage |= vk::BufferUsageFlagBits::eShaderDeviceAddress;
+    }
+
+    // dma-buf is the handle meant for sharing memory between different devices, an opaque handle only
+    // works between instances of the same device
+    std::vector<vk::ExternalMemoryHandleTypeFlagBits> types;
+#if !defined(_WIN32)
+    if (device->external_memory_dma_buf) {
+        types.push_back(vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT);
+    }
+#endif
+    types.push_back(vk_opaque_handle_type);
+
+    for (const auto type : types) {
+        const vk::ExternalMemoryProperties exp = ggml_vk_external_buffer_props(device->physical_device, usage, type);
+        if (!(exp.externalMemoryFeatures & vk::ExternalMemoryFeatureFlagBits::eExportable)) {
+            continue;
+        }
+        const bool dedicated = (bool)(exp.externalMemoryFeatures & vk::ExternalMemoryFeatureFlagBits::eDedicatedOnly);
+
+        for (const auto & peer : peers) {
+            if (peer == device->physical_device) {
+                continue;
+            }
+            const auto peer_props = peer.getProperties2<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceIDProperties>();
+            if (ggml_vk_can_import_from(peer, peer_props.get<vk::PhysicalDeviceIDProperties>(), device, type, dedicated)) {
+                device->export_handle_type = type;
+                device->export_dedicated = dedicated;
+                VK_LOG_DEBUG("ggml_vk_init_direct_copy(" << device->name << "): export as " << ggml_vk_handle_type_name(type));
+                return;
+            }
+        }
+    }
+}
+
+// Imports the memory of an exportable buffer of another device as a buffer that can only be copied from.
+static vk_buffer ggml_vk_import_buffer(vk_device& device, vk_buffer& src) {
+    const vk::ExternalMemoryHandleTypeFlagBits type = src->export_handle_type;
+    GGML_ASSERT(type != vk::ExternalMemoryHandleTypeFlagBits{});
+
+    vk::Buffer buffer = VK_NULL_HANDLE;
+    try {
+        vk_native_handle handle = ggml_vk_export_native_handle(src->device, src->device_memory, type);
+
+        vk::ExternalMemoryBufferCreateInfo external_bci { type };
+        vk::BufferCreateInfo bci { vk::BufferCreateFlags(), src->size, vk::BufferUsageFlagBits::eTransferSrc, vk::SharingMode::eExclusive, 0, nullptr };
+        bci.setPNext(&external_bci);
+        buffer = device->device.createBuffer(bci);
+
+        const vk::MemoryRequirements mem_req = device->device.getBufferMemoryRequirements(buffer);
+        uint32_t type_bits = mem_req.memoryTypeBits;
+        uint32_t memory_type_index = 0;
+        const vk::PhysicalDeviceMemoryProperties mem_props = device->physical_device.getMemoryProperties();
+
+#if !defined(_WIN32)
+        if (type == vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT) {
+            type_bits &= device->device.getMemoryFdPropertiesKHR(type, handle.get()).memoryTypeBits;
+            if (type_bits == 0) {
+                throw vk::OutOfDeviceMemoryError("no memory type can import the dma-buf");
+            }
+            // prefer device local memory, that is where an exported device buffer lives
+            bool found = false;
+            for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
+                if (!(type_bits & (1u << i))) {
+                    continue;
+                }
+                if (!found || (mem_props.memoryTypes[i].propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal)) {
+                    memory_type_index = i;
+                    found = true;
+                    if (mem_props.memoryTypes[i].propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal) {
+                        break;
+                    }
+                }
+            }
+        } else
+#endif
+        {
+            // an opaque handle is imported with the memory type it was exported with, which has the same index
+            // on the same physical device and has to be found by its properties on another one
+            if (ggml_vk_same_physical_device(src->device->id_props, device->id_props)) {
+                memory_type_index = src->memory_type_index;
+            } else {
+                bool found = false;
+                for (uint32_t i = 0; i < mem_props.memoryTypeCount && !found; i++) {
+                    if ((type_bits & (1u << i)) && mem_props.memoryTypes[i].propertyFlags == src->memory_property_flags) {
+                        memory_type_index = i;
+                        found = true;
+                    }
+                }
+                if (!found) {
+                    throw vk::OutOfDeviceMemoryError("no memory type matches the exported memory");
+                }
+            }
+            if (!(type_bits & (1u << memory_type_index))) {
+                throw vk::OutOfDeviceMemoryError("the exported memory type cannot hold the imported buffer");
+            }
+        }
+        if (mem_req.size > src->alloc_size) {
+            throw vk::OutOfDeviceMemoryError("the imported buffer needs more memory than the exported one");
+        }
+
+        vk::MemoryDedicatedAllocateInfo dedicated_info { {}, buffer };
+
+        vk_buffer buf = std::make_shared<vk_buffer_struct>();
+        buf->device_memory = ggml_vk_import_native_handle(device, src->alloc_size, memory_type_index, type, handle,
+                                                          src->device->export_dedicated ? &dedicated_info : nullptr);
+        handle.imported();
+
+        // buf owns the memory and the buffer from here on, and releases them when it is destroyed
+        buf->buffer = buffer;
+        buffer = VK_NULL_HANDLE;
+        buf->memory_property_flags = mem_props.memoryTypes[memory_type_index].propertyFlags;
+        buf->ptr = nullptr;
+        buf->alloc_size = src->alloc_size;
+        buf->memory_type_index = memory_type_index;
+        buf->device = device;
+        buf->size = src->size;
+        device->device.bindBufferMemory(buf->buffer, buf->device_memory, 0);
+        return buf;
+    } catch (const vk::SystemError & e) {
+        GGML_LOG_WARN("ggml_vulkan: importing a buffer of %s into %s failed (%s)\n", src->device->name.c_str(), device->name.c_str(), e.what());
+        if (buffer) {
+            device->device.destroyBuffer(buffer);
+        }
+        return nullptr;
+    }
+}
+
+// the view of src on device, imported on first use
+vk_buffer ggml_vk_buffer_get_import(vk_buffer& src, vk_device& device) {
+    std::lock_guard<std::mutex> guard(src->imports_mutex);
+    for (auto & imp : src->imports) {
+        if (imp->device == device) {
+            return imp;
+        }
+    }
+    vk_buffer imp = ggml_vk_import_buffer(device, src);
+    if (imp) {
+        src->imports.push_back(imp);
+    }
+    return imp;
+}
+
+// whether a copy out of src into the device dst can be recorded without blocking
+bool ggml_vk_buffer_copy_direct_ready(vk_buffer& src, vk_device& dst) {
+    return ggml_vk_peer_direct_ready(src, dst);
+}
+
+// Records a copy from a buffer of another device into ctx, a context of the device of dst. Only succeeds once a
+// copy between the two devices has verified the direct path, and does not wait for anything the source device is
+// still working on.
+bool ggml_vk_buffer_copy_direct_async(vk_context& ctx, vk_buffer& dst, size_t dst_offset, vk_buffer& src, size_t src_offset, size_t size) {
+    if (!ggml_vk_buffer_copy_direct_ready(src, dst->device)) {
+        return false;
+    }
+    vk_buffer imp = ggml_vk_buffer_get_import(src, dst->device);
+    if (!imp) {
+        return false;
+    }
+    ggml_vk_buffer_copy_async(ctx, dst, dst_offset, imp, src_offset, size);
+    ggml_vk_peer_count_direct_bytes(size);
+    return true;
+}
+
 void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& src, size_t src_offset, size_t size) {
     if (src->device == dst->device) {
         std::lock_guard<std::recursive_mutex> guard(src->device->mutex);
@@ -700,6 +1088,17 @@ void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& src, size
         ggml_vk_queue_command_pools_cleanup(src->device);
     } else {
         VK_LOG_DEBUG("ggml_vk_buffer_copy(MULTI_DEVICE, " << size << ")");
+        if (size == 0) {
+            return;
+        }
+
+        // without a copy on the CPU, when the two devices can do that
+        if (ggml_vk_peer_copy_try(src, src_offset, dst, dst_offset, size) != VK_PEER_PATH_NONE) {
+            return;
+        }
+
+        ggml_vk_peer_count_host_bytes(size);
+
         // Copy device to device through host staging, in chunks so the staging buffer of both devices stays small no matter how large the tensor is
         constexpr size_t chunk_size = 32*1024*1024;
 
