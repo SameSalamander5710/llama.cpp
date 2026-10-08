@@ -51,7 +51,11 @@ static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& 
             if (shader_core_props_amd.wavefrontsPerSimd == 20) {
                 return vk_device_architecture::AMD_RDNA1;
             }
-            if (shader_float8) {
+            // shader_float8 is missing on RDNA4 with the AMD proprietary driver, so also match the device name.
+            const std::string name = props.deviceName.data();
+            if (shader_float8 ||
+                name.find("Radeon RX 9") != std::string::npos ||
+                name.find("Radeon AI PRO R9") != std::string::npos) {
                 return vk_device_architecture::AMD_RDNA4;
             }
             if (integer_dot_props.integerDotProduct4x8BitPackedMixedSignednessAccelerated) {
