@@ -12985,6 +12985,8 @@ void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
 
 void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     VK_LOG_DEBUG("ggml_vk_cleanup(" << ctx->name << ")");
+    // finish the copies into this device, and stop their worker
+    ggml_vk_peer_copy_destroy(ctx);
     // discard any unsubmitted command buffers
     ctx->compute_ctx.reset();
     // wait for any pending command buffers to finish
@@ -13584,9 +13586,49 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
     }
 }
 
+// copies a tensor from the memory of another Vulkan device without blocking, see ggml-backend-impl.h. The copy is made by a worker thread with resources of its own, since the blocking copy between devices cannot run while the backends have work in flight
+static bool ggml_backend_vk_peer_copy_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+    VK_LOG_DEBUG("ggml_backend_vk_peer_copy_async(" << src << " -> " << dst << ", size=" << ggml_nbytes(src) << ")");
+    GGML_UNUSED(backend_src);
+
+    ggml_backend_buffer_t src_buffer = src->view_src ? src->view_src->buffer : src->buffer;
+    ggml_backend_buffer_t dst_buffer = dst->view_src ? dst->view_src->buffer : dst->buffer;
+    if (src_buffer == nullptr || dst_buffer == nullptr || !ggml_backend_buffer_is_vk(src_buffer) || !ggml_backend_buffer_is_vk(dst_buffer)) {
+        return false;
+    }
+    if (!ggml_are_same_layout(src, dst)) {
+        return false;
+    }
+    if (ggml_nbytes(src) == 0) {
+        return true;
+    }
+
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend_dst->context;
+    ggml_backend_vk_buffer_context * src_buf_ctx = (ggml_backend_vk_buffer_context *)src_buffer->context;
+    ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst_buffer->context;
+
+    // the copy has to land on the device of the backend that waits for it
+    if (dst_buf_ctx->dev_buffer->device != ctx->device) {
+        return false;
+    }
+
+    return ggml_vk_peer_copy_async(ctx,
+        src_buf_ctx->dev_buffer, vk_tensor_offset(src) + src->view_offs,
+        dst_buf_ctx->dev_buffer, vk_tensor_offset(dst) + dst->view_offs,
+        ggml_nbytes(src));
+}
+
+static void ggml_backend_vk_peer_copy_synchronize(ggml_backend_t backend_dst) {
+    VK_LOG_DEBUG("ggml_backend_vk_peer_copy_synchronize()");
+    ggml_vk_peer_copy_synchronize((ggml_backend_vk_context *)backend_dst->context);
+}
+
 static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
     VK_LOG_DEBUG("ggml_backend_vk_synchronize()");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+
+    // copies from other devices that are still running write to the memory of this backend
+    ggml_vk_peer_copy_synchronize(ctx);
 
     ggml_vk_synchronize(ctx);
 
@@ -16312,11 +16354,22 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_peer_copy_async") == 0) {
+        return (void *) ggml_backend_vk_peer_copy_async;
+    }
+    if (strcmp(name, "ggml_backend_peer_copy_synchronize") == 0) {
+        return (void *) ggml_backend_vk_peer_copy_synchronize;
+    }
+    return NULL;
+}
+
 static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_name         = */ ggml_backend_vk_reg_get_name,
     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
     /* .get_device       = */ ggml_backend_vk_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_vk_reg_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_vk_reg() {

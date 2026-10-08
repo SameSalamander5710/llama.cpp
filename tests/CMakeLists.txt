@@ -345,6 +345,9 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
 
     # Needs non-public ggml{,-backend}-impl.h
     llama_build_and_test(test-alloc.cpp)
+
+    # Skips itself unless it finds two Vulkan devices
+    llama_build_and_test(test-vulkan-peer-copy.cpp)
 endif()
 
 # decode-shaped mat-vec benchmark that defeats the GPU cache, only needs ggml

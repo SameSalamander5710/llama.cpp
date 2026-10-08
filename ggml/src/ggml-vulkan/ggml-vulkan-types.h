@@ -1262,6 +1262,8 @@ class vk_perf_logger {
     uint32_t print_count {};
 };
 
+struct vk_peer_copy_worker;
+
 struct ggml_backend_vk_context {
     std::string name;
 
@@ -1313,6 +1315,9 @@ struct ggml_backend_vk_context {
 
     vk_command_pool compute_cmd_pool;
     vk_command_pool transfer_cmd_pool;
+
+    // worker thread for the asynchronous copies from other devices into this one, created on first use
+    vk_peer_copy_worker * peer_copy {};
 
     // number of additional consecutive nodes that are being fused with the
     // node currently being processed
